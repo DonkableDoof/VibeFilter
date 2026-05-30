@@ -1,0 +1,1015 @@
+import React, { useState, useRef, useEffect, useMemo, useCallback } from "react";
+import { buildTheme, TAG_PALETTE, DEFAULT_TAGS } from "./theme";
+import { Icon, ICONS } from "./icons.jsx";
+import { fmtTime, parseName } from "./helpers";
+import { makeStyles } from "./styles";
+import { GlobalStyles } from "./GlobalStyles.jsx";
+
+/*
+  VibeFilter (Electron build)
+  ---------------------------
+  Native file access — real playback, embedded covers, persistence, and
+  drag-into-Premiere — is provided by window.vf (see electron/preload.js).
+
+  This file is the whole UI. It's organized as:
+    1. State          — every piece of live data the app tracks
+    2. Effects        — load/save, audio events, keyboard shortcuts, waveform
+    3. Playback       — select / play / pause / seek / shuffle, volume, waveform
+    4. Library        — tags, tracks, rename, filtering & sorting
+    5. Cover bank     — upload/assign/remove cover art
+    6. Selection      — multi-select for bulk actions
+    7. Render         — sidebar, track grid, player panel, dialogs
+
+  The WAVE_BARS / TARGET_RMS tuning constants live just above the functions
+  that use them.
+*/
+const WAVE_BARS = 120;   // number of bars drawn in the waveform
+const TARGET_RMS = 0.16; // reference loudness for volume normalization
+
+export default function App() {
+  // ── 1. State ──────────────────────────────────────────────────────────────
+  // Library & persistence
+  const [loaded, setLoaded] = useState(false);
+  const [settings, setSettings] = useState({ lightMode: false });
+  const [tracks, setTracks] = useState([]);
+  const [tags, setTags] = useState(DEFAULT_TAGS);
+
+  // Browsing (filter / search / which track is open)
+  const [activeFilters, setActiveFilters] = useState([]);
+  const [search, setSearch] = useState("");
+  const [selectedId, setSelectedId] = useState(null);
+  const [dragOver, setDragOver] = useState(false);
+
+  // Tag creation
+  const [newTag, setNewTag] = useState("");
+  const [newTagColor, setNewTagColor] = useState(TAG_PALETTE[0]);
+
+  // Playback
+  const audioRef = useRef(null);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [curTime, setCurTime] = useState(0);
+  const [duration, setDuration] = useState(0);
+  const [volume, setVolume] = useState(1);
+  const [peaks, setPeaks] = useState(null); // normalized waveform peaks, or "error", or null while loading
+  const peakCache = useRef({});             // trackId -> peaks
+  const gainCache = useRef({});             // trackId -> loudness gain multiplier
+  const waveCanvasRef = useRef(null);
+
+  // Cover bank, bulk selection, popups
+  const [bank, setBank] = useState([]);                       // [{ id, path }]
+  const [bankOpen, setBankOpen] = useState(false);
+  const [selectMode, setSelectMode] = useState(false);
+  const [selectedTracks, setSelectedTracks] = useState(() => new Set());
+  const [bankTargetTrack, setBankTargetTrack] = useState(null); // single-track cover apply target
+  const [ctxMenu, setCtxMenu] = useState(null);                 // { x, y, trackId } | null
+  const [renaming, setRenaming] = useState(null);              // { trackId, title, artist } | null
+
+  const isLight = settings.lightMode;
+  const t = useMemo(() => buildTheme(isLight), [isLight]);
+  const selected = tracks.find((tr) => tr.id === selectedId) || null;
+
+  // ── 2. Effects ────────────────────────────────────────────────────────────
+  // Load the saved library and cover bank once on startup.
+  useEffect(() => {
+    (async () => {
+      const lib = await window.vf.loadLibrary();
+      if (lib.tracks) setTracks(lib.tracks);
+      if (lib.tags) setTags(lib.tags);
+      if (lib.settings) {
+        setSettings(lib.settings);
+        if (typeof lib.settings.volume === "number") setVolume(lib.settings.volume);
+      }
+      setLoaded(true);
+    })();
+    (async () => {
+      const b = await window.vf.bankList();
+      setBank(b || []);
+    })();
+  }, []);
+
+  // Persist any change to the library (skipped until the initial load finishes).
+  useEffect(() => {
+    if (!loaded) return;
+    window.vf.saveLibrary({ tracks, tags, settings: { ...settings, volume } });
+  }, [tracks, tags, settings, volume, loaded]);
+
+  // Keep the <audio> element's volume in sync with the slider + per-track gain.
+  useEffect(() => {
+    applyVolume(volume, selectedId);
+  }, [volume, selectedId]);
+
+  // Subscribe to <audio> events for the current track.
+  useEffect(() => {
+    const a = audioRef.current;
+    if (!a) return;
+    const onTime = () => setCurTime(a.currentTime);
+    const onMeta = () => setDuration(a.duration);
+    const onEnd = () => setIsPlaying(false);
+    a.addEventListener("timeupdate", onTime);
+    a.addEventListener("loadedmetadata", onMeta);
+    a.addEventListener("ended", onEnd);
+    return () => {
+      a.removeEventListener("timeupdate", onTime);
+      a.removeEventListener("loadedmetadata", onMeta);
+      a.removeEventListener("ended", onEnd);
+    };
+  }, [selectedId]);
+
+  // Spacebar toggles play/pause (ignored while typing or renaming).
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.code !== "Space" && e.key !== " ") return;
+      const el = document.activeElement;
+      const tag = el && el.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || (el && el.isContentEditable)) return;
+      if (renaming) return;
+      if (!selected) return;
+      e.preventDefault();
+      togglePlay();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [selected, isPlaying, duration, renaming]);
+
+  // Escape closes the right-click menu.
+  useEffect(() => {
+    if (!ctxMenu) return;
+    const onEsc = (e) => { if (e.key === "Escape") setCtxMenu(null); };
+    window.addEventListener("keydown", onEsc);
+    return () => window.removeEventListener("keydown", onEsc);
+  }, [ctxMenu]);
+
+  // Redraw the waveform whenever the peaks, playback progress, or theme change.
+  useEffect(() => {
+    const canvas = waveCanvasRef.current;
+    if (!canvas || !Array.isArray(peaks)) return;
+    const dpr = window.devicePixelRatio || 1;
+    const cssW = canvas.clientWidth, cssH = canvas.clientHeight;
+    canvas.width = cssW * dpr; canvas.height = cssH * dpr;
+    const ctx = canvas.getContext("2d");
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, cssW, cssH);
+
+    const n = peaks.length;
+    const gap = 2;
+    const barW = (cssW - gap * (n - 1)) / n;
+    const progress = duration ? curTime / duration : 0;
+    const playedX = progress * cssW;
+
+    const grad = ctx.createLinearGradient(0, 0, cssW, 0);
+    grad.addColorStop(0, t.green);
+    grad.addColorStop(1, t.orange);
+
+    for (let i = 0; i < n; i++) {
+      const x = i * (barW + gap);
+      const h = Math.max(2, peaks[i] * cssH * 0.92);
+      const y = (cssH - h) / 2;
+      const played = x + barW / 2 <= playedX;
+      ctx.fillStyle = played ? grad : t.border;
+      const r = Math.min(barW / 2, 2);
+      ctx.beginPath();
+      ctx.moveTo(x + r, y);
+      ctx.arcTo(x + barW, y, x + barW, y + h, r);
+      ctx.arcTo(x + barW, y + h, x, y + h, r);
+      ctx.arcTo(x, y + h, x, y, r);
+      ctx.arcTo(x, y, x + barW, y, r);
+      ctx.closePath();
+      ctx.fill();
+    }
+  }, [peaks, curTime, duration, t, selectedId]);
+
+  // ── 3. Playback ───────────────────────────────────────────────────────────
+  // Effective volume = slider × per-track loudness gain, clamped to 0..1.
+  const applyVolume = (sliderVol, trackId) => {
+    const a = audioRef.current;
+    if (!a) return;
+    const gain = (trackId && gainCache.current[trackId]) || 1;
+    a.volume = Math.max(0, Math.min(1, sliderVol * gain));
+  };
+
+  // Add files (used by the picker and by drag-in), de-duplicating by file path.
+  const addTrackObjects = useCallback((objs) => {
+    if (!objs || !objs.length) return;
+    setTracks((prev) => {
+      const existingPaths = new Set(prev.map((p) => p.filePath));
+      const fresh = objs.filter((o) => !existingPaths.has(o.filePath));
+      return [...prev, ...fresh];
+    });
+  }, []);
+
+  const pickFiles = async () => {
+    const objs = await window.vf.pickFiles();
+    addTrackObjects(objs);
+  };
+
+  const onDrop = async (e) => {
+    e.preventDefault();
+    setDragOver(false);
+    const files = Array.from(e.dataTransfer.files || []);
+    const paths = files.map((f) => window.vf.pathForFile(f)).filter(Boolean);
+    if (paths.length) {
+      const objs = await window.vf.processFiles(paths);
+      addTrackObjects(objs);
+    }
+  };
+
+  // Decode the audio once to build the waveform peaks and a loudness gain.
+  const loadPeaks = useCallback(async (tr) => {
+    if (peakCache.current[tr.id]) { setPeaks(peakCache.current[tr.id]); return; }
+    setPeaks(null);
+    try {
+      const resp = await fetch(window.vf.fileUrl(tr.filePath));
+      const arr = await resp.arrayBuffer();
+      const AC = window.AudioContext || window.webkitAudioContext;
+      const ctx = new AC();
+      const audioBuf = await ctx.decodeAudioData(arr);
+      const raw = audioBuf.getChannelData(0); // first channel is plenty
+      const block = Math.floor(raw.length / WAVE_BARS) || 1;
+      const out = new Array(WAVE_BARS).fill(0);
+      let max = 0.0001;
+      let totalSq = 0;
+      for (let i = 0; i < WAVE_BARS; i++) {
+        let sum = 0;
+        const start = i * block;
+        for (let j = 0; j < block; j++) {
+          const v = raw[start + j] || 0;
+          sum += v * v;
+        }
+        totalSq += sum;
+        const rms = Math.sqrt(sum / block);
+        out[i] = rms;
+        if (rms > max) max = rms;
+      }
+      for (let i = 0; i < WAVE_BARS; i++) out[i] = out[i] / max; // normalize bars to 0..1
+
+      // Whole-track RMS → gain that nudges every track toward a common loudness.
+      const trackRms = Math.sqrt(totalSq / (WAVE_BARS * block)) || 0.0001;
+      let gain = TARGET_RMS / trackRms;
+      gain = Math.max(0.3, Math.min(3, gain)); // clamp so nothing is over-boosted or crushed
+      gainCache.current[tr.id] = gain;
+
+      ctx.close();
+      peakCache.current[tr.id] = out;
+      setSelectedId((cur) => {
+        if (cur === tr.id) { setPeaks(out); applyVolume(volume, tr.id); }
+        return cur;
+      });
+    } catch (e) {
+      setPeaks("error");
+    }
+  }, [volume]);
+
+  // Open a track in the player and start it playing.
+  const selectTrack = (tr) => {
+    setSelectedId(tr.id);
+    setIsPlaying(false);
+    setCurTime(0);
+    setDuration(tr.durationSec || 0);
+    if (audioRef.current) {
+      const a = audioRef.current;
+      a.src = window.vf.fileUrl(tr.filePath);
+      a.load();
+      applyVolume(volume, tr.id); // uses cached gain if available; loadPeaks refines it
+      a.play().then(() => setIsPlaying(true)).catch(() => setIsPlaying(false));
+    }
+    loadPeaks(tr);
+  };
+
+  const togglePlay = () => {
+    const a = audioRef.current;
+    if (!a || !selected) return;
+    if (isPlaying) {
+      a.pause();
+      setIsPlaying(false);
+    } else {
+      const dur = a.duration && isFinite(a.duration) ? a.duration : duration;
+      if (dur && a.currentTime >= dur - 0.25) { // at the end → replay from start
+        a.currentTime = 0;
+        setCurTime(0);
+      }
+      a.play().then(() => setIsPlaying(true)).catch(() => {});
+    }
+  };
+
+  const scrub = (e) => {
+    const a = audioRef.current;
+    if (!a) return;
+    const dur = a.duration && isFinite(a.duration) ? a.duration : duration;
+    if (!dur) return;
+    const rect = e.currentTarget.getBoundingClientRect();
+    const ratio = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+    const target = ratio * dur;
+    const applySeek = () => { a.currentTime = target; setCurTime(target); };
+    if (a.readyState < 1 || a.seekable.length === 0) { // not seekable yet → wait
+      const once = () => { applySeek(); a.removeEventListener("loadedmetadata", once); a.removeEventListener("canplay", once); };
+      a.addEventListener("loadedmetadata", once);
+      a.addEventListener("canplay", once);
+    } else {
+      applySeek();
+    }
+  };
+
+  // ── 4. Library (tags, tracks, rename, filter & sort) ──────────────────────
+  const toggleTrackTag = (trackId, tagId) => {
+    setTracks((prev) =>
+      prev.map((tr) =>
+        tr.id === trackId
+          ? { ...tr, tags: tr.tags.includes(tagId) ? tr.tags.filter((x) => x !== tagId) : [...tr.tags, tagId] }
+          : tr
+      )
+    );
+  };
+  const addTag = () => {
+    const label = newTag.trim();
+    if (!label) return;
+    const id = label.toLowerCase().replace(/\s+/g, "-") + "-" + Math.random().toString(36).slice(2, 5);
+    setTags((prev) => [...prev, { id, label, color: newTagColor }]);
+    setNewTag("");
+    // advance the default swatch to the next palette colour for convenience
+    const idx = TAG_PALETTE.indexOf(newTagColor);
+    setNewTagColor(TAG_PALETTE[(idx + 1) % TAG_PALETTE.length]);
+  };
+  const setTagColor = (tagId, color) => {
+    setTags((prev) => prev.map((tg) => (tg.id === tagId ? { ...tg, color } : tg)));
+  };
+  const removeTag = (tagId) => {
+    setTags((prev) => prev.filter((tg) => tg.id !== tagId));
+    setTracks((prev) => prev.map((tr) => ({ ...tr, tags: tr.tags.filter((x) => x !== tagId) })));
+    setActiveFilters((prev) => prev.filter((x) => x !== tagId));
+  };
+  const toggleFilter = (tagId) =>
+    setActiveFilters((prev) => (prev.includes(tagId) ? prev.filter((x) => x !== tagId) : [...prev, tagId]));
+
+  const removeTrack = (id) => {
+    if (selectedId === id) {
+      const a = audioRef.current;
+      if (a) { a.pause(); a.removeAttribute("src"); a.load(); }
+      setIsPlaying(false);
+      setCurTime(0);
+      setDuration(0);
+      setSelectedId(null);
+    }
+    setTracks((prev) => prev.filter((tr) => tr.id !== id));
+  };
+
+  const saveRename = () => {
+    if (!renaming) return;
+    const { trackId, title, artist } = renaming;
+    setTracks((prev) => prev.map((tr) =>
+      tr.id === trackId
+        ? { ...tr, customTitle: title.trim() || null, customArtist: artist.trim() || null }
+        : tr));
+    setRenaming(null);
+  };
+
+  const removeSelectedTracks = () => {
+    if (selectedTracks.size === 0) return;
+    if (selectedId && selectedTracks.has(selectedId)) {
+      const a = audioRef.current;
+      if (a) { a.pause(); a.removeAttribute("src"); a.load(); }
+      setIsPlaying(false);
+      setCurTime(0);
+      setDuration(0);
+      setSelectedId(null);
+    }
+    setTracks((prev) => prev.filter((tr) => !selectedTracks.has(tr.id)));
+    setSelectedTracks(new Set());
+  };
+
+  // Tracks matching the active search + tag filters, sorted by artist then title.
+  const filtered = tracks
+    .filter((tr) => {
+      const { title, artist } = parseName(tr);
+      const hay = (title + " " + (artist || "") + " " + tr.name).toLowerCase();
+      const matchSearch = hay.includes(search.toLowerCase());
+      const matchTags = activeFilters.every((f) => tr.tags.includes(f));
+      return matchSearch && matchTags;
+    })
+    .sort((a, b) => {
+      const pa = parseName(a), pb = parseName(b);
+      const aKey = (pa.artist || "\uffff").toLowerCase();
+      const bKey = (pb.artist || "\uffff").toLowerCase();
+      const byArtist = aKey.localeCompare(bKey, undefined, { sensitivity: "base" });
+      if (byArtist !== 0) return byArtist;
+      return pa.title.localeCompare(pb.title, undefined, { sensitivity: "base" });
+    });
+
+  const tagById = (id) => tags.find((tg) => tg.id === id);
+
+  // Pick a random track from the current filtered view and play it.
+  const shuffle = () => {
+    if (selectMode) return;
+    const pool = filtered;
+    if (pool.length === 0) return;
+    let pick = pool[Math.floor(Math.random() * pool.length)];
+    // Avoid repeating the current track when there's more than one option.
+    if (pool.length > 1 && pick.id === selectedId) {
+      const others = pool.filter((tr) => tr.id !== selectedId);
+      pick = others[Math.floor(Math.random() * others.length)];
+    }
+    selectTrack(pick);
+  };
+
+  // Effective cover for a track: an explicitly assigned bank cover wins (lets you
+  // override embedded art), then embedded art, then none.
+  const coverUrlFor = (tr) => {
+    if (tr.assignedCover) {
+      const found = bank.find((b) => b.id === tr.assignedCover);
+      if (found) return window.vf.fileUrl(found.path);
+    }
+    if (tr.coverPath) return window.vf.fileUrl(tr.coverPath);
+    return null;
+  };
+
+  // ── 5. Cover bank (upload / assign / remove cover art) ────────────────────
+  const addToBank = async () => {
+    const added = await window.vf.bankAdd();
+    if (added && added.length) setBank((prev) => [...prev, ...added]);
+  };
+  const deleteFromBank = async (id) => {
+    await window.vf.bankDelete(id);
+    setBank((prev) => prev.filter((b) => b.id !== id));
+    // Unassign from any tracks that used it
+    setTracks((prev) => prev.map((tr) =>
+      tr.assignedCover === id ? { ...tr, assignedCover: null } : tr));
+  };
+  const assignCoverToSelected = (bankId) => {
+    setTracks((prev) => prev.map((tr) =>
+      selectedTracks.has(tr.id) ? { ...tr, assignedCover: bankId } : tr));
+    setBankOpen(false);
+    setSelectMode(false);
+    setSelectedTracks(new Set());
+  };
+  const assignCoverToOne = (trackId, bankId) => {
+    setTracks((prev) => prev.map((tr) =>
+      tr.id === trackId ? { ...tr, assignedCover: bankId } : tr));
+  };
+
+  // ── 6. Selection (multi-select for bulk actions) + drag-out ───────────────
+  const toggleSelect = (id) => {
+    setSelectedTracks((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+  const selectAllWithoutCover = () => {
+    setSelectedTracks(new Set(filtered.filter((tr) => !coverUrlFor(tr)).map((tr) => tr.id)));
+  };
+  const exitSelectMode = () => { setSelectMode(false); setSelectedTracks(new Set()); };
+
+  // Hand a track off to the OS so it can be dragged into Premiere / Explorer.
+  const onTrackDragStart = (e, tr) => {
+    e.preventDefault();
+    window.vf.startDrag(tr.filePath);
+  };
+
+  // ── 7. Render ─────────────────────────────────────────────────────────────
+  const s = makeStyles(t);
+  const empty = tracks.length === 0;
+
+  return (
+    <div style={s.app}>
+      <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+      <GlobalStyles t={t} />
+      <audio ref={audioRef} />
+
+      <aside style={s.sidebar}>
+        <div style={s.logo}>
+          <img src="./app-icon.png" alt="VibeFilter" style={{ width: 34, height: 34, borderRadius: 9 }} />
+          <div>
+            <div style={{ fontSize: 16, fontWeight: 700, letterSpacing: -0.3 }}>VibeFilter</div>
+          </div>
+        </div>
+
+        <div style={s.section}>
+          <div style={s.label}>Filter by vibe</div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 7 }}>
+            {tags.length === 0 && <div style={{ fontSize: 12.5, color: t.textDim }}>No tags yet.</div>}
+            {tags.map((tg) => (
+              <span key={tg.id} style={s.chip(activeFilters.includes(tg.id), tg.color)}
+                onClick={() => toggleFilter(tg.id)}>
+                {tg.label}
+              </span>
+            ))}
+          </div>
+          {activeFilters.length > 0 && (
+            <div onClick={() => setActiveFilters([])}
+              style={{ marginTop: 10, fontSize: 12, color: t.green, cursor: "pointer", fontWeight: 600 }}>
+              Clear filters
+            </div>
+          )}
+        </div>
+
+        <div style={s.section}>
+          <div style={s.label}>Manage tags</div>
+          <div style={{ display: "flex", gap: 7, marginBottom: 10, alignItems: "center" }}>
+            <input type="color" className="vf-swatch" value={newTagColor}
+              title="Pick tag colour"
+              onChange={(e) => setNewTagColor(e.target.value)}
+              style={{ width: 30, height: 30, flexShrink: 0, borderRadius: 6 }} />
+            <input value={newTag} onChange={(e) => setNewTag(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && addTag()}
+              placeholder="New tag…"
+              style={{ ...s.searchInput, flex: 1, padding: "7px 10px", background: t.bgCard2,
+                border: `1px solid ${t.border}`, borderRadius: 8 }} />
+            <button onClick={addTag} style={{ ...s.iconBtn, width: 34, height: 34,
+              background: t.green, color: "#fff", border: "none" }}>
+              <Icon d={ICONS.plus} size={16} />
+            </button>
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+            {tags.map((tg) => (
+              <div key={tg.id} style={{ display: "flex", alignItems: "center", gap: 9, fontSize: 13 }}>
+                <input type="color" className="vf-swatch" value={tg.color}
+                  title="Change colour"
+                  onChange={(e) => setTagColor(tg.id, e.target.value)}
+                  style={{ width: 16, height: 16, flexShrink: 0, borderRadius: 5 }} />
+                <span style={{ flex: 1, color: t.textMuted }}>{tg.label}</span>
+                <span onClick={() => removeTag(tg.id)}
+                  title="Delete tag"
+                  onMouseEnter={(e) => (e.currentTarget.style.color = t.textMuted)}
+                  onMouseLeave={(e) => (e.currentTarget.style.color = t.textDim)}
+                  style={{ cursor: "pointer", color: t.textDim, display: "grid", placeItems: "center" }}>
+                  <Icon d={ICONS.x} size={14} />
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div style={{ marginTop: "auto", padding: 18, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+          <span style={{ fontSize: 12, color: t.textDim }}>{tracks.length} track{tracks.length !== 1 ? "s" : ""}</span>
+          <button style={s.iconBtn}
+            onClick={() => setSettings((p) => ({ ...p, lightMode: !p.lightMode }))}>
+            <Icon d={isLight ? ICONS.moon : ICONS.sun} size={16} />
+          </button>
+        </div>
+      </aside>
+
+      <div style={s.main}>
+        <div style={s.topbar}>
+          <div style={s.searchWrap}>
+            <Icon d={ICONS.search} size={16} />
+            <input style={s.searchInput} placeholder="Search tracks…"
+              value={search} onChange={(e) => setSearch(e.target.value)} />
+          </div>
+          <button style={{ ...s.iconBtn, ...(filtered.length === 0 || selectMode ? { opacity: 0.5, cursor: "not-allowed" } : {}) }}
+            title="Shuffle — play a random track"
+            disabled={filtered.length === 0 || selectMode}
+            onClick={shuffle}>
+            <Icon d={ICONS.shuffle} size={16} />
+          </button>
+          <button style={{ ...s.iconBtn, ...(selectMode ? { background: t.green, color: "#fff", borderColor: t.green } : {}) }}
+            title="Select tracks for bulk actions"
+            onClick={() => (selectMode ? exitSelectMode() : setSelectMode(true))}>
+            <Icon d={ICONS.check} size={16} />
+          </button>
+          <button style={s.iconBtn} title="Cover bank" onClick={() => setBankOpen(true)}>
+            <Icon d={ICONS.image} size={16} />
+          </button>
+          <button style={s.iconBtn} title="Add files" onClick={pickFiles}>
+            <Icon d={ICONS.upload} size={16} />
+          </button>
+        </div>
+
+        {selectMode && (
+          <div style={{ padding: "10px 24px", borderBottom: `1px solid ${t.border}`,
+            background: t.bgCard, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+            <span style={{ fontSize: 13, fontWeight: 600 }}>
+              {selectedTracks.size} selected
+            </span>
+            <button onClick={selectAllWithoutCover}
+              style={{ fontSize: 12.5, fontWeight: 600, color: t.green, background: "none",
+                border: "none", cursor: "pointer", fontFamily: "inherit" }}>
+              Select all without a cover
+            </button>
+            <div style={{ flex: 1 }} />
+            <button onClick={() => setBankOpen(true)} disabled={selectedTracks.size === 0}
+              style={{ display: "inline-flex", alignItems: "center", gap: 7, padding: "7px 14px",
+                borderRadius: 8, border: "none", fontFamily: "inherit", fontSize: 13, fontWeight: 600,
+                cursor: selectedTracks.size ? "pointer" : "not-allowed",
+                background: selectedTracks.size ? t.green : t.bgCard2,
+                color: selectedTracks.size ? "#fff" : t.textDim }}>
+              <Icon d={ICONS.image} size={15} /> Apply cover to selected
+            </button>
+            <button onClick={removeSelectedTracks} disabled={selectedTracks.size === 0}
+              onMouseEnter={(e) => { if (selectedTracks.size) { e.currentTarget.style.background = t.red; e.currentTarget.style.color = "#fff"; e.currentTarget.style.borderColor = t.red; } }}
+              onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = selectedTracks.size ? t.red : t.textDim; e.currentTarget.style.borderColor = selectedTracks.size ? t.red : t.border; }}
+              style={{ display: "inline-flex", alignItems: "center", gap: 7, padding: "7px 14px",
+                borderRadius: 8, fontFamily: "inherit", fontSize: 13, fontWeight: 600,
+                cursor: selectedTracks.size ? "pointer" : "not-allowed",
+                background: "transparent", transition: "background 0.15s, color 0.15s, border-color 0.15s",
+                border: `1px solid ${selectedTracks.size ? t.red : t.border}`,
+                color: selectedTracks.size ? t.red : t.textDim }}>
+              <Icon d={ICONS.trash} size={15} /> Delete selected
+            </button>
+            <button onClick={exitSelectMode}
+              style={{ fontSize: 12.5, fontWeight: 600, color: t.textMuted, background: "none",
+                border: "none", cursor: "pointer", fontFamily: "inherit" }}>
+              Done
+            </button>
+          </div>
+        )}
+
+        <div style={s.content}>
+          <div style={s.list} className="vf-scroll"
+            onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+            onDragLeave={() => setDragOver(false)}
+            onDrop={onDrop}>
+            {empty ? (
+              <div style={{
+                height: "100%", border: `2px dashed ${dragOver ? t.green : t.border}`,
+                borderRadius: 16, display: "flex", flexDirection: "column",
+                alignItems: "center", justifyContent: "center", gap: 14,
+                color: t.textMuted, background: dragOver ? t.accentBg : "transparent",
+              }}>
+                <div style={{ ...s.logoMark, width: 56, height: 56, borderRadius: 16 }}>
+                  <Icon d={ICONS.upload} size={26} />
+                </div>
+                <div style={{ fontSize: 17, fontWeight: 600, color: t.text }}>Drop your music here</div>
+                <div style={{ fontSize: 13.5 }}>MP3, WAV, M4A, FLAC and more — or click the upload button.</div>
+              </div>
+            ) : (
+              <>
+                {dragOver && (
+                  <div style={{ padding: 12, marginBottom: 12, borderRadius: 10,
+                    border: `2px dashed ${t.green}`, color: t.green, textAlign: "center",
+                    fontSize: 13, fontWeight: 600, background: t.accentBg }}>
+                    Drop to add more tracks
+                  </div>
+                )}
+                {filtered.length === 0 ? (
+                  <div style={{ color: t.textMuted, fontSize: 14, padding: 20 }}>
+                    No tracks match these filters.
+                  </div>
+                ) : (
+                  <div style={s.grid}>
+                    {filtered.map((tr) => {
+                      const active = tr.id === selectedId;
+                      const isSel = selectedTracks.has(tr.id);
+                      const { title, artist } = parseName(tr);
+                      const coverUrl = coverUrlFor(tr);
+                      const cardClick = () => {
+                        if (selectMode) toggleSelect(tr.id);
+                        else selectTrack(tr);
+                      };
+                      return (
+                        <div key={tr.id}
+                          className="vf-tile"
+                          tabIndex={-1}
+                          style={{
+                            ...s.trackCard(active),
+                            ...(selectMode && isSel ? { borderColor: t.green, background: t.accentBg } : {}),
+                            cursor: selectMode ? "pointer" : "grab",
+                            outline: "none",
+                          }}
+                          draggable={!selectMode}
+                          onDragStart={(e) => onTrackDragStart(e, tr)}
+                          onContextMenu={(e) => {
+                            e.preventDefault();
+                            setCtxMenu({ x: e.clientX, y: e.clientY, trackId: tr.id });
+                          }}
+                          onClick={cardClick}>
+                          <div style={{ position: "relative", marginBottom: 10 }}>
+                            {coverUrl
+                              ? <img src={coverUrl} alt="" style={{ ...s.cover, marginBottom: 0 }} />
+                              : <div style={{ ...s.cover, marginBottom: 0 }}><Icon d={ICONS.music} size={28} /></div>}
+                            {selectMode && (
+                              <div style={{
+                                position: "absolute", top: 8, left: 8, width: 24, height: 24,
+                                borderRadius: "50%", display: "grid", placeItems: "center",
+                                background: isSel ? t.green : "rgba(0,0,0,0.45)",
+                                border: `2px solid ${isSel ? t.green : "#fff"}`, color: "#fff" }}>
+                                {isSel && <Icon d={ICONS.check} size={14} />}
+                              </div>
+                            )}
+                          </div>
+                          <div style={{ minWidth: 0 }}>
+                            <div style={{ fontSize: 13.5, fontWeight: 600, whiteSpace: "nowrap",
+                              overflow: "hidden", textOverflow: "ellipsis" }}>{title}</div>
+                            {artist && (
+                              <div style={{ fontSize: 11.5, color: t.textMuted, marginTop: 1,
+                                whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{artist}</div>
+                            )}
+                            <div style={{ display: "flex", alignItems: "center", gap: 5, marginTop: 8, minHeight: 11 }}>
+                              {tr.tags.length === 0 ? (
+                                <span style={{ fontSize: 10.5, color: t.textDim }}>No tags</span>
+                              ) : tr.tags.map((tagId) => {
+                                const tg = tagById(tagId);
+                                if (!tg) return null;
+                                return (
+                                  <span key={tagId} title={tg.label}
+                                    style={{ width: 10, height: 10, borderRadius: "50%",
+                                      background: tg.color, flexShrink: 0,
+                                      boxShadow: `0 0 0 2px ${t.bgCard}` }} />
+                                );
+                              })}
+                            </div>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+
+          <aside style={s.player} className="vf-scroll">
+            <div style={s.label}>Now previewing</div>
+            {selected ? (
+              <>
+                <div style={{
+                  width: "100%", aspectRatio: "1 / 1", flexShrink: 0,
+                  borderRadius: 16, overflow: "hidden",
+                  background: `linear-gradient(135deg, ${t.greenBg}, ${t.orangeBg})`,
+                  display: "grid", placeItems: "center", marginBottom: 18,
+                  border: `1px solid ${t.border}`,
+                }}>
+                  {coverUrlFor(selected)
+                    ? <img src={coverUrlFor(selected)} alt=""
+                        style={{ width: "100%", height: "100%", objectFit: "cover", display: "block" }} />
+                    : <Icon d={ICONS.music} size={48} />}
+                </div>
+
+                {(() => { const { title, artist } = parseName(selected); return (
+                  <>
+                    <div style={{ fontSize: 17, fontWeight: 700, letterSpacing: -0.3, marginBottom: 2 }}>{title}</div>
+                    <div style={{ fontSize: 12.5, color: t.textDim, marginBottom: 18 }}>{artist || selected.fileName}</div>
+                  </>
+                ); })()}
+
+                {Array.isArray(peaks) ? (
+                  <canvas ref={waveCanvasRef} onClick={scrub}
+                    style={{ width: "100%", height: 64, cursor: "pointer", display: "block",
+                      marginBottom: 8 }} />
+                ) : (
+                  <div onClick={scrub}
+                    style={{ height: 64, borderRadius: 10, background: t.bgCard2, cursor: "pointer",
+                      position: "relative", marginBottom: 8, border: `1px solid ${t.border}`,
+                      overflow: "hidden", display: "grid", placeItems: "center" }}>
+                    <div style={{
+                      position: "absolute", top: 0, left: 0, bottom: 0,
+                      width: `${duration ? (curTime / duration) * 100 : 0}%`,
+                      background: t.accentBg,
+                    }} />
+                    <span style={{ fontSize: 11.5, color: t.textDim, position: "relative" }}>
+                      {peaks === "error" ? "Waveform unavailable" : "Analyzing waveform…"}
+                    </span>
+                  </div>
+                )}
+                <div style={{ display: "flex", justifyContent: "space-between",
+                  fontSize: 12, color: t.textMuted, marginBottom: 18 }}>
+                  <span>{fmtTime(curTime)}</span>
+                  <span>{fmtTime(duration)}</span>
+                </div>
+
+                <div style={{ display: "flex", justifyContent: "center", alignItems: "center", gap: 18, marginBottom: 18 }}>
+                  <button onClick={togglePlay}
+                    style={{
+                      width: 60, height: 60, borderRadius: "50%", border: "none", cursor: "pointer",
+                      background: `linear-gradient(135deg, ${t.green}, ${t.orange})`,
+                      color: "#fff", display: "grid", placeItems: "center",
+                    }}>
+                    <Icon d={isPlaying ? ICONS.pause : ICONS.play} size={22}
+                      fill={isPlaying ? "none" : "currentColor"} />
+                  </button>
+                  <button onClick={shuffle} title="Shuffle — play a random track"
+                    style={{
+                      width: 42, height: 42, borderRadius: "50%", cursor: "pointer",
+                      background: t.bgCard2, border: `1px solid ${t.border}`,
+                      color: t.textMuted, display: "grid", placeItems: "center",
+                    }}>
+                    <Icon d={ICONS.shuffle} size={17} />
+                  </button>
+                </div>
+
+                <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 22 }}>
+                  <span onClick={() => setVolume((v) => (v > 0 ? 0 : 1))}
+                    title={volume > 0 ? "Mute" : "Unmute"}
+                    style={{ color: t.textMuted, cursor: "pointer", display: "grid", placeItems: "center" }}>
+                    <Icon d={volume === 0 ? ICONS.volumeMute : ICONS.volume} size={17} />
+                  </span>
+                  <input type="range" min={0} max={1} step={0.01} value={volume}
+                    onChange={(e) => setVolume(parseFloat(e.target.value))}
+                    className="vf-volume"
+                    style={{
+                      flex: 1, height: 6, cursor: "pointer",
+                      accentColor: t.green,
+                      background: "transparent",
+                    }} />
+                  <span style={{ fontSize: 12, color: t.textDim, minWidth: 32, textAlign: "right" }}>
+                    {Math.round(volume * 100)}%
+                  </span>
+                </div>
+
+                <div style={s.label}>Tags</div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 7 }}>
+                  {tags.map((tg) => {
+                    const on = selected.tags.includes(tg.id);
+                    return (
+                      <span key={tg.id} onClick={() => toggleTrackTag(selected.id, tg.id)}
+                        style={s.chip(on, tg.color)}>{tg.label}</span>
+                    );
+                  })}
+                </div>
+
+                <div style={{ marginTop: 18, display: "flex", gap: 8, flexWrap: "wrap" }}>
+                  {!selected.assignedCover && (
+                    <button onClick={() => { setBankTargetTrack(selected.id); setBankOpen(true); }}
+                      style={{ display: "inline-flex", alignItems: "center", gap: 8,
+                        padding: "8px 14px", borderRadius: 9, border: `1px solid ${t.border}`,
+                        background: t.bgCard2, color: t.textMuted, cursor: "pointer", fontSize: 13,
+                        fontWeight: 600, fontFamily: "inherit" }}>
+                      <Icon d={ICONS.image} size={15} /> {selected.coverPath ? "Override cover" : "Set cover"}
+                    </button>
+                  )}
+                  {selected.assignedCover && (
+                    <>
+                      <button onClick={() => { setBankTargetTrack(selected.id); setBankOpen(true); }}
+                        style={{ display: "inline-flex", alignItems: "center", gap: 8,
+                          padding: "8px 14px", borderRadius: 9, border: `1px solid ${t.border}`,
+                          background: t.bgCard2, color: t.textMuted, cursor: "pointer", fontSize: 13,
+                          fontWeight: 600, fontFamily: "inherit" }}>
+                        <Icon d={ICONS.image} size={15} /> Change cover
+                      </button>
+                      <button onClick={() => assignCoverToOne(selected.id, null)}
+                        style={{ display: "inline-flex", alignItems: "center", gap: 8,
+                          padding: "8px 14px", borderRadius: 9, border: `1px solid ${t.border}`,
+                          background: t.bgCard2, color: t.textMuted, cursor: "pointer", fontSize: 13,
+                          fontWeight: 600, fontFamily: "inherit" }}>
+                        <Icon d={ICONS.x} size={15} /> {selected.coverPath ? "Revert to original" : "Remove cover"}
+                      </button>
+                    </>
+                  )}
+                </div>
+              </>
+            ) : (
+              <div style={{ flex: 1, display: "grid", placeItems: "center", textAlign: "center",
+                color: t.textDim, fontSize: 13.5 }}>
+                Click a track to preview it here.
+              </div>
+            )}
+          </aside>
+        </div>
+      </div>
+
+      {ctxMenu && (() => {
+        const ctxTrack = tracks.find((x) => x.id === ctxMenu.trackId);
+        const itemBase = { display: "flex", alignItems: "center", gap: 9, width: "100%",
+          padding: "8px 10px", borderRadius: 7, border: "none", background: "transparent",
+          cursor: "pointer", fontSize: 13, fontWeight: 600, fontFamily: "inherit",
+          transition: "background 0.12s, color 0.12s", textAlign: "left" };
+        return (
+        <>
+          <div onClick={() => setCtxMenu(null)} onContextMenu={(e) => { e.preventDefault(); setCtxMenu(null); }}
+            style={{ position: "fixed", inset: 0, zIndex: 60 }} />
+          <div style={{
+            position: "fixed", left: Math.min(ctxMenu.x, window.innerWidth - 200),
+            top: Math.min(ctxMenu.y, window.innerHeight - 150), zIndex: 61,
+            background: t.bgCard, border: `1px solid ${t.border}`, borderRadius: 10,
+            boxShadow: "0 10px 30px rgba(0,0,0,0.35)", padding: 5, minWidth: 180 }}>
+            <button
+              onClick={() => {
+                const { title, artist } = parseName(ctxTrack);
+                setRenaming({ trackId: ctxMenu.trackId, title: title || "", artist: artist || "" });
+                setCtxMenu(null);
+              }}
+              onMouseEnter={(e) => (e.currentTarget.style.background = t.bgHover)}
+              onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+              style={{ ...itemBase, color: t.text }}>
+              <Icon d={ICONS.edit} size={15} /> Rename
+            </button>
+            <button
+              onClick={() => { window.vf.reveal(ctxTrack.filePath); setCtxMenu(null); }}
+              onMouseEnter={(e) => (e.currentTarget.style.background = t.bgHover)}
+              onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+              style={{ ...itemBase, color: t.text }}>
+              <Icon d={ICONS.reveal} size={15} /> Reveal in file explorer
+            </button>
+            <div style={{ height: 1, background: t.border, margin: "4px 6px" }} />
+            <button
+              onClick={() => { removeTrack(ctxMenu.trackId); setCtxMenu(null); }}
+              onMouseEnter={(e) => { e.currentTarget.style.background = t.red; e.currentTarget.style.color = "#fff"; }}
+              onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; e.currentTarget.style.color = t.red; }}
+              style={{ ...itemBase, color: t.red }}>
+              <Icon d={ICONS.trash} size={15} /> Delete track
+            </button>
+          </div>
+        </>
+      ); })()}
+
+      {renaming && (
+        <div onClick={() => setRenaming(null)}
+          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)",
+            display: "grid", placeItems: "center", zIndex: 70 }}>
+          <div onClick={(e) => e.stopPropagation()}
+            style={{ width: 380, maxWidth: "90vw", background: t.bgCard, borderRadius: 14,
+              border: `1px solid ${t.border}`, padding: 22, boxShadow: "0 20px 60px rgba(0,0,0,0.4)" }}>
+            <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 4 }}>Rename track</div>
+            <div style={{ fontSize: 12.5, color: t.textDim, marginBottom: 16 }}>
+              Leave a field empty to restore its original value.
+            </div>
+            <div style={{ fontSize: 12, fontWeight: 600, color: t.textMuted, marginBottom: 6 }}>Title</div>
+            <input autoFocus value={renaming.title}
+              onChange={(e) => setRenaming((r) => ({ ...r, title: e.target.value }))}
+              onKeyDown={(e) => { if (e.key === "Enter") saveRename(); if (e.key === "Escape") setRenaming(null); }}
+              style={{ width: "100%", boxSizing: "border-box", padding: "9px 11px", marginBottom: 14,
+                background: t.bgCard2, border: `1px solid ${t.border}`, borderRadius: 8,
+                color: t.text, fontSize: 14, fontFamily: "inherit", outline: "none" }} />
+            <div style={{ fontSize: 12, fontWeight: 600, color: t.textMuted, marginBottom: 6 }}>Artist / Game</div>
+            <input value={renaming.artist}
+              onChange={(e) => setRenaming((r) => ({ ...r, artist: e.target.value }))}
+              onKeyDown={(e) => { if (e.key === "Enter") saveRename(); if (e.key === "Escape") setRenaming(null); }}
+              style={{ width: "100%", boxSizing: "border-box", padding: "9px 11px", marginBottom: 20,
+                background: t.bgCard2, border: `1px solid ${t.border}`, borderRadius: 8,
+                color: t.text, fontSize: 14, fontFamily: "inherit", outline: "none" }} />
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+              <button onClick={() => setRenaming(null)}
+                style={{ padding: "8px 16px", borderRadius: 8, border: `1px solid ${t.border}`,
+                  background: t.bgCard2, color: t.textMuted, cursor: "pointer", fontSize: 13,
+                  fontWeight: 600, fontFamily: "inherit" }}>
+                Cancel
+              </button>
+              <button onClick={saveRename}
+                style={{ padding: "8px 16px", borderRadius: 8, border: "none",
+                  background: t.green, color: "#fff", cursor: "pointer", fontSize: 13,
+                  fontWeight: 600, fontFamily: "inherit" }}>
+                Save
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {bankOpen && (
+        <div onClick={() => { setBankOpen(false); setBankTargetTrack(null); }}
+          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)",
+            display: "grid", placeItems: "center", zIndex: 50 }}>
+          <div onClick={(e) => e.stopPropagation()}
+            style={{ width: 620, maxWidth: "90vw", maxHeight: "82vh", background: t.bgCard,
+              borderRadius: 16, border: `1px solid ${t.border}`, display: "flex",
+              flexDirection: "column", overflow: "hidden", boxShadow: "0 20px 60px rgba(0,0,0,0.4)" }}>
+            <div style={{ padding: "18px 22px", borderBottom: `1px solid ${t.border}`,
+              display: "flex", alignItems: "center", gap: 12 }}>
+              <div style={{ fontSize: 16, fontWeight: 700, flex: 1 }}>Cover bank</div>
+              <button onClick={addToBank}
+                style={{ display: "inline-flex", alignItems: "center", gap: 7, padding: "7px 13px",
+                  borderRadius: 8, border: "none", background: t.green, color: "#fff", cursor: "pointer",
+                  fontSize: 13, fontWeight: 600, fontFamily: "inherit" }}>
+                <Icon d={ICONS.plus} size={15} /> Upload images
+              </button>
+              <span onClick={() => { setBankOpen(false); setBankTargetTrack(null); }}
+                style={{ cursor: "pointer", color: t.textMuted, display: "grid", placeItems: "center", padding: 4 }}>
+                <Icon d={ICONS.x} size={18} />
+              </span>
+            </div>
+
+            <div style={{ padding: "12px 22px", fontSize: 13, color: t.textMuted,
+              borderBottom: `1px solid ${t.border}` }}>
+              {bankTargetTrack
+                ? "Click a cover to apply it to this track."
+                : selectedTracks.size > 0
+                ? `Click a cover to apply it to ${selectedTracks.size} selected track${selectedTracks.size !== 1 ? "s" : ""}.`
+                : "Upload images to build your bank. Turn on select mode (✓) to apply a cover to many tracks at once."}
+            </div>
+
+            <div className="vf-scroll" style={{ padding: 22, overflow: "auto",
+              display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(120px, 1fr))", gap: 14 }}>
+              {bank.length === 0 ? (
+                <div style={{ gridColumn: "1 / -1", textAlign: "center", color: t.textDim,
+                  fontSize: 13.5, padding: "30px 0" }}>
+                  No covers yet. Click “Upload images” to add some.
+                </div>
+              ) : bank.map((b) => {
+                const clickable = !!bankTargetTrack || selectedTracks.size > 0;
+                return (
+                  <div key={b.id} style={{ position: "relative" }}>
+                    <img src={window.vf.fileUrl(b.path)} alt=""
+                      onClick={() => {
+                        if (bankTargetTrack) { assignCoverToOne(bankTargetTrack, b.id); setBankOpen(false); setBankTargetTrack(null); }
+                        else if (selectedTracks.size > 0) { assignCoverToSelected(b.id); }
+                      }}
+                      style={{ width: "100%", aspectRatio: "1 / 1", objectFit: "cover",
+                        borderRadius: 10, border: `1px solid ${t.border}`, display: "block",
+                        cursor: clickable ? "pointer" : "default",
+                        transition: "border-color 0.15s" }}
+                      onMouseEnter={(e) => { if (clickable) e.currentTarget.style.borderColor = t.green; }}
+                      onMouseLeave={(e) => { e.currentTarget.style.borderColor = t.border; }} />
+                    <span onClick={() => deleteFromBank(b.id)} title="Delete from bank"
+                      style={{ position: "absolute", top: 5, right: 5, width: 24, height: 24,
+                        borderRadius: 7, background: t.bgCard2, border: `1px solid ${t.border}`,
+                        display: "grid", placeItems: "center", cursor: "pointer", color: t.textMuted }}>
+                      <Icon d={ICONS.trash} size={13} />
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

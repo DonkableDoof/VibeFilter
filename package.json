@@ -1,0 +1,41 @@
+{
+  "name": "vibefilter",
+  "version": "1.0.1",
+  "description": "",
+  "author": "DuckableDev",
+  "main": "electron/main.js",
+  "scripts": {
+    "dev": "concurrently -k \"vite\" \"wait-on tcp:5173 && cross-env ELECTRON_START_URL=http://localhost:5173 electron .\"",
+    "build": "vite build",
+    "start": "npm run dev",
+    "dist": "vite build && electron-builder"
+  },
+  "build": {
+    "appId": "com.duckabledev.vibefilter",
+    "productName": "VibeFilter",
+    "copyright": "DuckableDev",
+    "files": [
+      "dist/**/*",
+      "electron/**/*"
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "mac": { "target": "dmg", "icon": "electron/app-icon.png" },
+    "win": { "target": "nsis", "icon": "electron/app-icon.ico" }
+  },
+  "dependencies": {
+    "music-metadata": "^7.14.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.1",
+    "concurrently": "^8.2.2",
+    "cross-env": "^7.0.3",
+    "electron": "^31.0.0",
+    "electron-builder": "^24.13.3",
+    "vite": "^5.3.1",
+    "wait-on": "^7.2.0"
+  }
+}
