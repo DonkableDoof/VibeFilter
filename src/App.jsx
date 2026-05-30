@@ -4,6 +4,7 @@ import { Icon, ICONS } from "./icons.jsx";
 import { fmtTime, parseName } from "./helpers";
 import { makeStyles } from "./styles";
 import { GlobalStyles } from "./GlobalStyles.jsx";
+import { TooltipButton } from "./TooltipButton.jsx";
 
 /*
   VibeFilter (Electron build)
@@ -36,6 +37,7 @@ export default function App() {
 
   // Browsing (filter / search / which track is open)
   const [activeFilters, setActiveFilters] = useState([]);
+  const [favsOnly, setFavsOnly] = useState(false);
   const [search, setSearch] = useState("");
   const [selectedId, setSelectedId] = useState(null);
   const [dragOver, setDragOver] = useState(false);
@@ -53,6 +55,7 @@ export default function App() {
   const [peaks, setPeaks] = useState(null); // normalized waveform peaks, or "error", or null while loading
   const peakCache = useRef({});             // trackId -> peaks
   const gainCache = useRef({});             // trackId -> loudness gain multiplier
+  const playNextRef = useRef(() => {});     // always holds the latest "play next track" fn
   const waveCanvasRef = useRef(null);
 
   // Cover bank, bulk selection, popups
@@ -73,7 +76,11 @@ export default function App() {
   useEffect(() => {
     (async () => {
       const lib = await window.vf.loadLibrary();
-      if (lib.tracks) setTracks(lib.tracks);
+      if (lib.tracks) {
+        // Migrate any legacy `favorite` key to `favourite`.
+        setTracks(lib.tracks.map((tr) =>
+          "favorite" in tr ? { ...tr, favourite: tr.favourite ?? tr.favorite, favorite: undefined } : tr));
+      }
       if (lib.tags) setTags(lib.tags);
       if (lib.settings) {
         setSettings(lib.settings);
@@ -104,7 +111,7 @@ export default function App() {
     if (!a) return;
     const onTime = () => setCurTime(a.currentTime);
     const onMeta = () => setDuration(a.duration);
-    const onEnd = () => setIsPlaying(false);
+    const onEnd = () => { setIsPlaying(false); playNextRef.current(); };
     a.addEventListener("timeupdate", onTime);
     a.addEventListener("loadedmetadata", onMeta);
     a.addEventListener("ended", onEnd);
@@ -115,17 +122,28 @@ export default function App() {
     };
   }, [selectedId]);
 
-  // Spacebar toggles play/pause (ignored while typing or renaming).
+  // Keyboard: Space = play/pause, Left/Right = seek ∓5s (ignored while typing/renaming).
   useEffect(() => {
     const onKey = (e) => {
-      if (e.code !== "Space" && e.key !== " ") return;
       const el = document.activeElement;
       const tag = el && el.tagName;
-      if (tag === "INPUT" || tag === "TEXTAREA" || (el && el.isContentEditable)) return;
-      if (renaming) return;
-      if (!selected) return;
-      e.preventDefault();
-      togglePlay();
+      const typing = tag === "INPUT" || tag === "TEXTAREA" || (el && el.isContentEditable);
+      if (typing || renaming || !selected) return;
+
+      if (e.code === "Space" || e.key === " ") {
+        e.preventDefault();
+        togglePlay();
+      } else if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
+        const a = audioRef.current;
+        if (!a) return;
+        const dur = a.duration && isFinite(a.duration) ? a.duration : duration;
+        if (!dur) return;
+        e.preventDefault();
+        const step = e.key === "ArrowRight" ? 5 : -5;
+        const target = Math.min(dur, Math.max(0, a.currentTime + step));
+        a.currentTime = target;
+        setCurTime(target);
+      }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
@@ -340,6 +358,24 @@ export default function App() {
   const toggleFilter = (tagId) =>
     setActiveFilters((prev) => (prev.includes(tagId) ? prev.filter((x) => x !== tagId) : [...prev, tagId]));
 
+  const toggleFavourite = (id) => {
+    setTracks((prev) => prev.map((tr) =>
+      tr.id === id ? { ...tr, favourite: !tr.favourite } : tr));
+  };
+  // Bulk favourite: favourite-first. If every selected track is already a
+  // favourite, this unfavourites them all; otherwise it favourites them all.
+  const selectedAllFav = tracks.length > 0 &&
+    [...selectedTracks].length > 0 &&
+    [...selectedTracks].every((id) => {
+      const tr = tracks.find((x) => x.id === id);
+      return tr && tr.favourite;
+    });
+  const favouriteSelected = () => {
+    if (selectedTracks.size === 0) return;
+    setTracks((prev) => prev.map((tr) =>
+      selectedTracks.has(tr.id) ? { ...tr, favourite: !selectedAllFav } : tr));
+  };
+
   const removeTrack = (id) => {
     if (selectedId === id) {
       const a = audioRef.current;
@@ -383,7 +419,8 @@ export default function App() {
       const hay = (title + " " + (artist || "") + " " + tr.name).toLowerCase();
       const matchSearch = hay.includes(search.toLowerCase());
       const matchTags = activeFilters.every((f) => tr.tags.includes(f));
-      return matchSearch && matchTags;
+      const matchFavs = !favsOnly || tr.favourite;
+      return matchSearch && matchTags && matchFavs;
     })
     .sort((a, b) => {
       const pa = parseName(a), pb = parseName(b);
@@ -395,6 +432,9 @@ export default function App() {
     });
 
   const tagById = (id) => tags.find((tg) => tg.id === id);
+
+  // Total duration of the whole library, rounded to whole minutes.
+  const totalMinutes = Math.round(tracks.reduce((sum, tr) => sum + (tr.durationSec || 0), 0) / 60);
 
   // Pick a random track from the current filtered view and play it.
   const shuffle = () => {
@@ -409,6 +449,19 @@ export default function App() {
     }
     selectTrack(pick);
   };
+
+  // Play the next track in the current list order, wrapping to the first at the end.
+  // Independent of shuffle — shuffle only picks the *current* random track.
+  const playNext = () => {
+    const pool = filtered;
+    if (pool.length === 0) return;
+    const idx = pool.findIndex((tr) => tr.id === selectedId);
+    const next = idx === -1 ? pool[0] : pool[(idx + 1) % pool.length];
+    selectTrack(next);
+  };
+  // Keep the ref current so the <audio> "ended" handler always calls the
+  // latest version (with up-to-date filtered list and selection).
+  playNextRef.current = playNext;
 
   // Effective cover for a track: an explicitly assigned bank cover wins (lets you
   // override embedded art), then embedded art, then none.
@@ -485,16 +538,23 @@ export default function App() {
         <div style={s.section}>
           <div style={s.label}>Filter by vibe</div>
           <div style={{ display: "flex", flexWrap: "wrap", gap: 7 }}>
-            {tags.length === 0 && <div style={{ fontSize: 12.5, color: t.textDim }}>No tags yet.</div>}
+            <span style={{ ...s.chip(favsOnly, "#facc15"), padding: "5px 9px" }}
+              title="Show only favourites"
+              onClick={() => setFavsOnly((v) => !v)}>
+              <Icon d={ICONS.star} size={14} fill={favsOnly ? "currentColor" : "none"} />
+            </span>
             {tags.map((tg) => (
               <span key={tg.id} style={s.chip(activeFilters.includes(tg.id), tg.color)}
                 onClick={() => toggleFilter(tg.id)}>
                 {tg.label}
               </span>
             ))}
+            {tags.length === 0 && (
+              <span style={{ fontSize: 12.5, color: t.textDim, alignSelf: "center" }}>No tags yet.</span>
+            )}
           </div>
-          {activeFilters.length > 0 && (
-            <div onClick={() => setActiveFilters([])}
+          {(activeFilters.length > 0 || favsOnly) && (
+            <div onClick={() => { setActiveFilters([]); setFavsOnly(false); }}
               style={{ marginTop: 10, fontSize: 12, color: t.green, cursor: "pointer", fontWeight: 600 }}>
               Clear filters
             </div>
@@ -539,7 +599,9 @@ export default function App() {
         </div>
 
         <div style={{ marginTop: "auto", padding: 18, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          <span style={{ fontSize: 12, color: t.textDim }}>{tracks.length} track{tracks.length !== 1 ? "s" : ""}</span>
+          <span style={{ fontSize: 12, color: t.textDim }}>
+            {tracks.length} track{tracks.length !== 1 ? "s" : ""} · {totalMinutes} min
+          </span>
           <button style={s.iconBtn}
             onClick={() => setSettings((p) => ({ ...p, lightMode: !p.lightMode }))}>
             <Icon d={isLight ? ICONS.moon : ICONS.sun} size={16} />
@@ -554,23 +616,25 @@ export default function App() {
             <input style={s.searchInput} placeholder="Search tracks…"
               value={search} onChange={(e) => setSearch(e.target.value)} />
           </div>
-          <button style={{ ...s.iconBtn, ...(filtered.length === 0 || selectMode ? { opacity: 0.5, cursor: "not-allowed" } : {}) }}
-            title="Shuffle — play a random track"
+          <TooltipButton label="Shuffle" t={t}
             disabled={filtered.length === 0 || selectMode}
-            onClick={shuffle}>
+            onClick={shuffle}
+            style={{ ...s.iconBtn, ...(filtered.length === 0 || selectMode ? { opacity: 0.5, cursor: "not-allowed" } : {}) }}>
             <Icon d={ICONS.shuffle} size={16} />
-          </button>
-          <button style={{ ...s.iconBtn, ...(selectMode ? { background: t.green, color: "#fff", borderColor: t.green } : {}) }}
-            title="Select tracks for bulk actions"
-            onClick={() => (selectMode ? exitSelectMode() : setSelectMode(true))}>
+          </TooltipButton>
+          <TooltipButton label={selectMode ? "Exit select mode" : "Select tracks"} t={t}
+            onClick={() => (selectMode ? exitSelectMode() : setSelectMode(true))}
+            style={{ ...s.iconBtn, ...(selectMode ? { background: t.green, color: "#fff", border: `1px solid ${t.green}` } : {}) }}>
             <Icon d={ICONS.check} size={16} />
-          </button>
-          <button style={s.iconBtn} title="Cover bank" onClick={() => setBankOpen(true)}>
+          </TooltipButton>
+          <TooltipButton label="Cover bank" t={t}
+            onClick={() => setBankOpen(true)} style={s.iconBtn}>
             <Icon d={ICONS.image} size={16} />
-          </button>
-          <button style={s.iconBtn} title="Add files" onClick={pickFiles}>
+          </TooltipButton>
+          <TooltipButton label="Add files" t={t}
+            onClick={pickFiles} style={s.iconBtn}>
             <Icon d={ICONS.upload} size={16} />
-          </button>
+          </TooltipButton>
         </div>
 
         {selectMode && (
@@ -585,6 +649,14 @@ export default function App() {
               Select all without a cover
             </button>
             <div style={{ flex: 1 }} />
+            <button onClick={favouriteSelected} disabled={selectedTracks.size === 0}
+              style={{ display: "inline-flex", alignItems: "center", gap: 7, padding: "7px 14px",
+                borderRadius: 8, border: "none", fontFamily: "inherit", fontSize: 13, fontWeight: 600,
+                cursor: selectedTracks.size ? "pointer" : "not-allowed",
+                background: selectedTracks.size ? "#facc15" : t.bgCard2,
+                color: selectedTracks.size ? "#1a1a1a" : t.textDim }}>
+              <Icon d={ICONS.star} size={15} fill="currentColor" /> {selectedAllFav ? "Unfavourite selected" : "Favourite selected"}
+            </button>
             <button onClick={() => setBankOpen(true)} disabled={selectedTracks.size === 0}
               style={{ display: "inline-flex", alignItems: "center", gap: 7, padding: "7px 14px",
                 borderRadius: 8, border: "none", fontFamily: "inherit", fontSize: 13, fontWeight: 600,
@@ -660,7 +732,9 @@ export default function App() {
                           tabIndex={-1}
                           style={{
                             ...s.trackCard(active),
-                            ...(selectMode && isSel ? { borderColor: t.green, background: t.accentBg } : {}),
+                            ...(selectMode && isSel
+                              ? { border: `1px solid ${t.green}`, background: t.accentBg }
+                              : {}),
                             cursor: selectMode ? "pointer" : "grab",
                             outline: "none",
                           }}
@@ -682,6 +756,14 @@ export default function App() {
                                 background: isSel ? t.green : "rgba(0,0,0,0.45)",
                                 border: `2px solid ${isSel ? t.green : "#fff"}`, color: "#fff" }}>
                                 {isSel && <Icon d={ICONS.check} size={14} />}
+                              </div>
+                            )}
+                            {tr.favourite && (
+                              <div style={{
+                                position: "absolute", top: 8, right: 8, width: 24, height: 24,
+                                borderRadius: "50%", display: "grid", placeItems: "center",
+                                background: "rgba(0,0,0,0.45)", color: "#facc15" }}>
+                                <Icon d={ICONS.star} size={14} fill="currentColor" />
                               </div>
                             )}
                           </div>
@@ -867,9 +949,17 @@ export default function App() {
             style={{ position: "fixed", inset: 0, zIndex: 60 }} />
           <div style={{
             position: "fixed", left: Math.min(ctxMenu.x, window.innerWidth - 200),
-            top: Math.min(ctxMenu.y, window.innerHeight - 150), zIndex: 61,
+            top: Math.min(ctxMenu.y, window.innerHeight - 190), zIndex: 61,
             background: t.bgCard, border: `1px solid ${t.border}`, borderRadius: 10,
             boxShadow: "0 10px 30px rgba(0,0,0,0.35)", padding: 5, minWidth: 180 }}>
+            <button
+              onClick={() => { toggleFavourite(ctxMenu.trackId); setCtxMenu(null); }}
+              onMouseEnter={(e) => (e.currentTarget.style.background = t.bgHover)}
+              onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+              style={{ ...itemBase, color: ctxTrack && ctxTrack.favourite ? "#eab308" : t.text }}>
+              <Icon d={ICONS.star} size={15} fill={ctxTrack && ctxTrack.favourite ? "currentColor" : "none"} />
+              {ctxTrack && ctxTrack.favourite ? "Unfavourite" : "Favourite"}
+            </button>
             <button
               onClick={() => {
                 const { title, artist } = parseName(ctxTrack);

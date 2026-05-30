@@ -23,6 +23,8 @@ export const GlobalStyles = ({ t }) => (
       background-clip: padding-box;
     }
     .vf-scroll::-webkit-scrollbar-corner { background: transparent; }
+    button { outline: none !important; }
+    button:focus, button:focus-visible, button:active { outline: none !important; }
     .vf-tile { outline: none !important; -webkit-user-select: none; user-select: none; -webkit-user-drag: element; }
     .vf-tile:focus, .vf-tile:focus-visible, .vf-tile:active, .vf-tile:focus-within { outline: none !important; box-shadow: none !important; }
     .vf-tile * { outline: none !important; }
