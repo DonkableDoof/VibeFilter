@@ -1,3 +1,5 @@
+import { contrastText } from "./helpers";
+
 // Builds the inline-style objects used across the app from the active theme `t`.
 // Functions (chip, trackCard) return styles that depend on per-element state.
 export const makeStyles = (t) => ({
@@ -58,7 +60,7 @@ export const makeStyles = (t) => ({
     borderRadius: 999, fontSize: 12.5, fontWeight: 600, cursor: "pointer",
     userSelect: "none", transition: "border-color 0.15s, transform 0.15s",
     background: active ? color : t.bgCard2,
-    color: active ? "#fff" : t.textMuted,
+    color: active ? contrastText(color) : t.textMuted,
     border: `1px solid ${active ? color : t.border}`,
   }),
   trackCard: (active) => ({

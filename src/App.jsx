@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect, useMemo, useCallback } from "react";
-import { buildTheme, TAG_PALETTE, DEFAULT_TAGS } from "./theme";
+import { buildTheme, ACCENTS, TAG_PALETTE, DEFAULT_TAGS } from "./theme";
 import { Icon, ICONS } from "./icons.jsx";
 import { fmtTime, parseName } from "./helpers";
 import { makeStyles } from "./styles";
@@ -45,6 +45,7 @@ export default function App() {
   // Tag creation
   const [newTag, setNewTag] = useState("");
   const [newTagColor, setNewTagColor] = useState(TAG_PALETTE[0]);
+  const [addTagOpen, setAddTagOpen] = useState(false);
 
   // Playback
   const audioRef = useRef(null);
@@ -66,9 +67,21 @@ export default function App() {
   const [bankTargetTrack, setBankTargetTrack] = useState(null); // single-track cover apply target
   const [ctxMenu, setCtxMenu] = useState(null);                 // { x, y, trackId } | null
   const [renaming, setRenaming] = useState(null);              // { trackId, title, artist } | null
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [hoverSlice, setHoverSlice] = useState(null); // index of hovered pie slice, or null
 
   const isLight = settings.lightMode;
-  const t = useMemo(() => buildTheme(isLight), [isLight]);
+  const accentName = settings.accent || "Blue / Pink";
+  const accentIcon = {
+    "Blue / Pink": "./icon-blue-pink.png",
+    "Green / Lime": "./icon-green-lime.png",
+    "Purple / Pink": "./icon-purple-pink.png",
+    "Orange / Red": "./icon-orange-red.png",
+    "Teal / Cyan": "./icon-teal-cyan.png",
+  }[accentName] || "./app-icon.png";
+  const tileSize = settings.tileSize || "medium";
+  const setTileSize = (size) => setSettings((p) => ({ ...p, tileSize: size }));
+  const t = useMemo(() => buildTheme(isLight, accentName), [isLight, accentName]);
   const selected = tracks.find((tr) => tr.id === selectedId) || null;
 
   // ── 2. Effects ────────────────────────────────────────────────────────────
@@ -99,6 +112,11 @@ export default function App() {
     if (!loaded) return;
     window.vf.saveLibrary({ tracks, tags, settings: { ...settings, volume } });
   }, [tracks, tags, settings, volume, loaded]);
+
+  // Update the window/taskbar icon to match the chosen accent theme.
+  useEffect(() => {
+    if (window.vf.setIcon) window.vf.setIcon(accentName);
+  }, [accentName]);
 
   // Keep the <audio> element's volume in sync with the slider + per-track gain.
   useEffect(() => {
@@ -337,15 +355,19 @@ export default function App() {
       )
     );
   };
+  const randomTagColor = () => TAG_PALETTE[Math.floor(Math.random() * TAG_PALETTE.length)];
+  const openAddTag = () => {
+    setNewTag("");
+    setNewTagColor(randomTagColor()); // suggest a random palette colour each time
+    setAddTagOpen(true);
+  };
   const addTag = () => {
     const label = newTag.trim();
     if (!label) return;
     const id = label.toLowerCase().replace(/\s+/g, "-") + "-" + Math.random().toString(36).slice(2, 5);
     setTags((prev) => [...prev, { id, label, color: newTagColor }]);
     setNewTag("");
-    // advance the default swatch to the next palette colour for convenience
-    const idx = TAG_PALETTE.indexOf(newTagColor);
-    setNewTagColor(TAG_PALETTE[(idx + 1) % TAG_PALETTE.length]);
+    setAddTagOpen(false);
   };
   const setTagColor = (tagId, color) => {
     setTags((prev) => prev.map((tg) => (tg.id === tagId ? { ...tg, color } : tg)));
@@ -436,6 +458,17 @@ export default function App() {
   // Total duration of the whole library, rounded to whole minutes.
   const totalMinutes = Math.round(tracks.reduce((sum, tr) => sum + (tr.durationSec || 0), 0) / 60);
 
+  // Track counts grouped by artist/game, most tracks first (for the Settings stats).
+  const artistCounts = (() => {
+    const counts = {};
+    for (const tr of tracks) {
+      const { artist } = parseName(tr);
+      const key = artist || "Unknown";
+      counts[key] = (counts[key] || 0) + 1;
+    }
+    return Object.entries(counts).sort((a, b) => b[1] - a[1]);
+  })();
+
   // Pick a random track from the current filtered view and play it.
   const shuffle = () => {
     if (selectMode) return;
@@ -520,6 +553,19 @@ export default function App() {
   // ── 7. Render ─────────────────────────────────────────────────────────────
   const s = makeStyles(t);
   const empty = tracks.length === 0;
+  const tileMin = { small: 110, medium: 160, large: 230 }[tileSize];
+
+  // Colours for pie slices: alternate the two accent colours plus a few neutrals
+  // so adjacent slices stay distinguishable even with many artists.
+  const SLICE_COLORS = [t.green, t.orange, "#a78bfa", "#34d399", "#facc15",
+    "#38bdf8", "#fb7185", "#c084fc", "#22d3ee", "#fb923c"];
+  // Build an SVG arc path for a pie slice from startAngle to endAngle (radians).
+  const arcPath = (cx, cy, r, startAngle, endAngle) => {
+    const x1 = cx + r * Math.cos(startAngle), y1 = cy + r * Math.sin(startAngle);
+    const x2 = cx + r * Math.cos(endAngle), y2 = cy + r * Math.sin(endAngle);
+    const largeArc = endAngle - startAngle > Math.PI ? 1 : 0;
+    return `M ${cx} ${cy} L ${x1} ${y1} A ${r} ${r} 0 ${largeArc} 1 ${x2} ${y2} Z`;
+  };
 
   return (
     <div style={s.app}>
@@ -529,7 +575,7 @@ export default function App() {
 
       <aside style={s.sidebar}>
         <div style={s.logo}>
-          <img src="./app-icon.png" alt="VibeFilter" style={{ width: 34, height: 34, borderRadius: 9 }} />
+          <img src={accentIcon} alt="VibeFilter" style={{ width: 34, height: 34, borderRadius: 9 }} />
           <div>
             <div style={{ fontSize: 16, fontWeight: 700, letterSpacing: -0.3 }}>VibeFilter</div>
           </div>
@@ -563,21 +609,13 @@ export default function App() {
 
         <div style={s.section}>
           <div style={s.label}>Manage tags</div>
-          <div style={{ display: "flex", gap: 7, marginBottom: 10, alignItems: "center" }}>
-            <input type="color" className="vf-swatch" value={newTagColor}
-              title="Pick tag colour"
-              onChange={(e) => setNewTagColor(e.target.value)}
-              style={{ width: 30, height: 30, flexShrink: 0, borderRadius: 6 }} />
-            <input value={newTag} onChange={(e) => setNewTag(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && addTag()}
-              placeholder="New tag…"
-              style={{ ...s.searchInput, flex: 1, padding: "7px 10px", background: t.bgCard2,
-                border: `1px solid ${t.border}`, borderRadius: 8 }} />
-            <button onClick={addTag} style={{ ...s.iconBtn, width: 34, height: 34,
-              background: t.green, color: "#fff", border: "none" }}>
-              <Icon d={ICONS.plus} size={16} />
-            </button>
-          </div>
+          <button onClick={openAddTag}
+            style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 7,
+              width: "100%", padding: "8px 10px", marginBottom: 10, borderRadius: 8,
+              border: `1px dashed ${t.border}`, background: t.bgCard2, color: t.textMuted,
+              cursor: "pointer", fontSize: 13, fontWeight: 600, fontFamily: "inherit" }}>
+            <Icon d={ICONS.plus} size={15} /> Add tag
+          </button>
           <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
             {tags.map((tg) => (
               <div key={tg.id} style={{ display: "flex", alignItems: "center", gap: 9, fontSize: 13 }}>
@@ -598,14 +636,32 @@ export default function App() {
           </div>
         </div>
 
-        <div style={{ marginTop: "auto", padding: 18, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          <span style={{ fontSize: 12, color: t.textDim }}>
+        <div style={{ marginTop: "auto", padding: 18, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+          <span style={{ fontSize: 12, color: t.textDim, whiteSpace: "nowrap",
+            overflow: "hidden", textOverflow: "ellipsis", minWidth: 0 }}>
             {tracks.length} track{tracks.length !== 1 ? "s" : ""} · {totalMinutes} min
           </span>
-          <button style={s.iconBtn}
-            onClick={() => setSettings((p) => ({ ...p, lightMode: !p.lightMode }))}>
-            <Icon d={isLight ? ICONS.moon : ICONS.sun} size={16} />
-          </button>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexShrink: 0 }}>
+            <div style={{ display: "flex", height: 34, borderRadius: 8, overflow: "hidden",
+              border: `1px solid ${t.border}`, flexShrink: 0 }}>
+              {["small", "medium", "large"].map((size) => (
+                <button key={size} title={`${size[0].toUpperCase()}${size.slice(1)} tiles`}
+                  onClick={() => setTileSize(size)}
+                  style={{
+                    border: "none", cursor: "pointer", padding: "0 9px",
+                    fontSize: 12, fontWeight: 700, fontFamily: "inherit",
+                    background: tileSize === size ? t.green : t.bgCard2,
+                    color: tileSize === size ? "#fff" : t.textMuted }}>
+                  {size[0].toUpperCase()}
+                </button>
+              ))}
+            </div>
+            <TooltipButton label="Settings" t={t}
+              onClick={() => setSettingsOpen(true)}
+              style={{ ...s.iconBtn, width: 34, height: 34, flexShrink: 0 }}>
+              <Icon d={ICONS.settings} size={16} />
+            </TooltipButton>
+          </div>
         </div>
       </aside>
 
@@ -716,7 +772,7 @@ export default function App() {
                     No tracks match these filters.
                   </div>
                 ) : (
-                  <div style={s.grid}>
+                  <div style={{ ...s.grid, gridTemplateColumns: `repeat(auto-fill, minmax(${tileMin}px, 1fr))` }}>
                     {filtered.map((tr) => {
                       const active = tr.id === selectedId;
                       const isSel = selectedTracks.has(tr.id);
@@ -990,6 +1046,47 @@ export default function App() {
         </>
       ); })()}
 
+      {addTagOpen && (
+        <div onClick={() => setAddTagOpen(false)}
+          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)",
+            display: "grid", placeItems: "center", zIndex: 70 }}>
+          <div onClick={(e) => e.stopPropagation()}
+            style={{ width: 340, maxWidth: "90vw", background: t.bgCard, borderRadius: 14,
+              border: `1px solid ${t.border}`, padding: 22, boxShadow: "0 20px 60px rgba(0,0,0,0.4)" }}>
+            <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 16 }}>New tag</div>
+            <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 18 }}>
+              <input type="color" className="vf-swatch" value={newTagColor}
+                title="Tag colour"
+                onChange={(e) => setNewTagColor(e.target.value)}
+                style={{ width: 38, height: 38, flexShrink: 0, borderRadius: 8 }} />
+              <input autoFocus value={newTag}
+                onChange={(e) => setNewTag(e.target.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") addTag(); if (e.key === "Escape") setAddTagOpen(false); }}
+                placeholder="Tag name…"
+                style={{ flex: 1, boxSizing: "border-box", padding: "9px 11px",
+                  background: t.bgCard2, border: `1px solid ${t.border}`, borderRadius: 8,
+                  color: t.text, fontSize: 14, fontFamily: "inherit", outline: "none" }} />
+            </div>
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+              <button onClick={() => setAddTagOpen(false)}
+                style={{ padding: "8px 16px", borderRadius: 8, border: `1px solid ${t.border}`,
+                  background: t.bgCard2, color: t.textMuted, cursor: "pointer", fontSize: 13,
+                  fontWeight: 600, fontFamily: "inherit" }}>
+                Cancel
+              </button>
+              <button onClick={addTag} disabled={!newTag.trim()}
+                style={{ padding: "8px 16px", borderRadius: 8, border: "none",
+                  background: newTag.trim() ? t.green : t.bgCard2,
+                  color: newTag.trim() ? "#fff" : t.textDim,
+                  cursor: newTag.trim() ? "pointer" : "not-allowed", fontSize: 13,
+                  fontWeight: 600, fontFamily: "inherit" }}>
+                Add tag
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {renaming && (
         <div onClick={() => setRenaming(null)}
           style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)",
@@ -1028,6 +1125,179 @@ export default function App() {
                   fontWeight: 600, fontFamily: "inherit" }}>
                 Save
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {settingsOpen && (
+        <div onClick={() => setSettingsOpen(false)}
+          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)",
+            display: "grid", placeItems: "center", zIndex: 70 }}>
+          <div onClick={(e) => e.stopPropagation()}
+            style={{ width: 460, maxWidth: "92vw", maxHeight: "85vh", background: t.bgCard,
+              borderRadius: 16, border: `1px solid ${t.border}`, display: "flex", flexDirection: "column",
+              overflow: "hidden", boxShadow: "0 20px 60px rgba(0,0,0,0.4)" }}>
+            <div style={{ padding: "18px 22px", borderBottom: `1px solid ${t.border}`,
+              display: "flex", alignItems: "center" }}>
+              <div style={{ fontSize: 16, fontWeight: 700, flex: 1 }}>Settings</div>
+              <span onClick={() => setSettingsOpen(false)}
+                style={{ cursor: "pointer", color: t.textMuted, display: "grid", placeItems: "center", padding: 4 }}>
+                <Icon d={ICONS.x} size={18} />
+              </span>
+            </div>
+
+            <div className="vf-scroll" style={{ padding: 22, overflow: "auto" }}>
+              {/* Appearance */}
+              <div style={s.label}>Appearance</div>
+              <div style={{ display: "flex", gap: 8, marginBottom: 18 }}>
+                <button onClick={() => setSettings((p) => ({ ...p, lightMode: false }))}
+                  style={{ flex: 1, display: "inline-flex", alignItems: "center", justifyContent: "center",
+                    gap: 8, padding: "10px", borderRadius: 10, cursor: "pointer", fontFamily: "inherit",
+                    fontSize: 13, fontWeight: 600,
+                    border: `1px solid ${!isLight ? t.green : t.border}`,
+                    background: !isLight ? t.accentBg : t.bgCard2,
+                    color: !isLight ? t.green : t.textMuted }}>
+                  <Icon d={ICONS.moon} size={15} /> Dark
+                </button>
+                <button onClick={() => setSettings((p) => ({ ...p, lightMode: true }))}
+                  style={{ flex: 1, display: "inline-flex", alignItems: "center", justifyContent: "center",
+                    gap: 8, padding: "10px", borderRadius: 10, cursor: "pointer", fontFamily: "inherit",
+                    fontSize: 13, fontWeight: 600,
+                    border: `1px solid ${isLight ? t.green : t.border}`,
+                    background: isLight ? t.accentBg : t.bgCard2,
+                    color: isLight ? t.green : t.textMuted }}>
+                  <Icon d={ICONS.sun} size={15} /> Light
+                </button>
+              </div>
+
+              {/* Accent theme */}
+              <div style={s.label}>Accent theme</div>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 22 }}>
+                {Object.entries(ACCENTS).map(([name, pair]) => {
+                  const [c1, c2] = isLight ? pair.light : pair.dark;
+                  const active = accentName === name;
+                  return (
+                    <button key={name} onClick={() => setSettings((p) => ({ ...p, accent: name }))}
+                      title={name}
+                      style={{ display: "inline-flex", alignItems: "center", gap: 8, padding: "7px 11px",
+                        borderRadius: 999, cursor: "pointer", fontFamily: "inherit", fontSize: 12.5, fontWeight: 600,
+                        border: `1px solid ${active ? t.green : t.border}`,
+                        background: active ? t.accentBg : t.bgCard2,
+                        color: active ? t.text : t.textMuted }}>
+                      <span style={{ width: 16, height: 16, borderRadius: "50%",
+                        background: `linear-gradient(135deg, ${c1}, ${c2})`, flexShrink: 0 }} />
+                      {name}
+                    </button>
+                  );
+                })}
+              </div>
+
+              {/* Library stats */}
+              <div style={s.label}>Your library</div>
+              <div style={{ display: "flex", gap: 10, marginBottom: 18 }}>
+                <div style={{ flex: 1, padding: 14, borderRadius: 12, background: t.bgCard2,
+                  border: `1px solid ${t.border}`, textAlign: "center" }}>
+                  <div style={{ fontSize: 24, fontWeight: 700, color: t.green }}>{tracks.length}</div>
+                  <div style={{ fontSize: 12, color: t.textDim }}>tracks</div>
+                </div>
+                <div style={{ flex: 1, padding: 14, borderRadius: 12, background: t.bgCard2,
+                  border: `1px solid ${t.border}`, textAlign: "center" }}>
+                  <div style={{ fontSize: 24, fontWeight: 700, color: t.orange }}>{totalMinutes}</div>
+                  <div style={{ fontSize: 12, color: t.textDim }}>minutes</div>
+                </div>
+                <div style={{ flex: 1, padding: 14, borderRadius: 12, background: t.bgCard2,
+                  border: `1px solid ${t.border}`, textAlign: "center" }}>
+                  <div style={{ fontSize: 24, fontWeight: 700, color: t.text }}>{artistCounts.length}</div>
+                  <div style={{ fontSize: 12, color: t.textDim }}>artists</div>
+                </div>
+              </div>
+
+              {/* Per-artist breakdown */}
+              {artistCounts.length > 0 && (
+                <>
+                  <div style={{ ...s.label, marginBottom: 8 }}>Tracks by artist / game</div>
+                  <div className="vf-scroll"
+                    style={{ display: "flex", gap: 18, overflow: "auto", minHeight: 0, flex: 1,
+                      alignItems: "flex-start" }}>
+                    {/* Pie */}
+                    <svg viewBox="0 0 200 200" width={180} height={180} style={{ flexShrink: 0 }}>
+                      {(() => {
+                        const total = tracks.length;
+                        // A single artist (one full-circle slice) can't be drawn as an arc,
+                        // so render it as a plain circle.
+                        if (artistCounts.length === 1) {
+                          return (
+                            <circle cx={100} cy={100} r={92}
+                              fill={SLICE_COLORS[0]} stroke={t.bgCard} strokeWidth={2}
+                              style={{ cursor: "pointer" }}
+                              onMouseEnter={() => setHoverSlice(0)}
+                              onMouseLeave={() => setHoverSlice(null)} />
+                          );
+                        }
+                        let angle = -Math.PI / 2; // start at top
+                        return artistCounts.map(([name, count], i) => {
+                          const slice = (count / total) * Math.PI * 2;
+                          const start = angle;
+                          const end = angle + slice;
+                          angle = end;
+                          const hovered = hoverSlice === i;
+                          // nudge hovered slice outward slightly
+                          const mid = (start + end) / 2;
+                          const offset = hovered ? 6 : 0;
+                          const cx = 100 + offset * Math.cos(mid);
+                          const cy = 100 + offset * Math.sin(mid);
+                          return (
+                            <path key={name}
+                              d={arcPath(cx, cy, 92, start, end)}
+                              fill={SLICE_COLORS[i % SLICE_COLORS.length]}
+                              stroke={t.bgCard} strokeWidth={2}
+                              style={{ cursor: "pointer", transition: "transform 0.1s" }}
+                              onMouseEnter={() => setHoverSlice(i)}
+                              onMouseLeave={() => setHoverSlice(null)} />
+                          );
+                        });
+                      })()}
+                    </svg>
+
+                    {/* Hover detail + legend */}
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ minHeight: 44, marginBottom: 10 }}>
+                        {hoverSlice !== null && artistCounts[hoverSlice] ? (
+                          <>
+                            <div style={{ fontSize: 14, fontWeight: 700, whiteSpace: "nowrap",
+                              overflow: "hidden", textOverflow: "ellipsis" }}>
+                              {artistCounts[hoverSlice][0]}
+                            </div>
+                            <div style={{ fontSize: 12.5, color: t.textDim }}>
+                              {artistCounts[hoverSlice][1]} track{artistCounts[hoverSlice][1] !== 1 ? "s" : ""}
+                              {" · "}
+                              {Math.round((artistCounts[hoverSlice][1] / tracks.length) * 100)}%
+                            </div>
+                          </>
+                        ) : (
+                          <div style={{ fontSize: 12.5, color: t.textDim }}>Hover a slice to see details.</div>
+                        )}
+                      </div>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+                        {artistCounts.map(([name, count], i) => (
+                          <div key={name}
+                            onMouseEnter={() => setHoverSlice(i)}
+                            onMouseLeave={() => setHoverSlice(null)}
+                            style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5,
+                              cursor: "pointer", opacity: hoverSlice === null || hoverSlice === i ? 1 : 0.45 }}>
+                            <span style={{ width: 10, height: 10, borderRadius: 3, flexShrink: 0,
+                              background: SLICE_COLORS[i % SLICE_COLORS.length] }} />
+                            <span style={{ flex: 1, color: t.textMuted, whiteSpace: "nowrap",
+                              overflow: "hidden", textOverflow: "ellipsis" }}>{name}</span>
+                            <span style={{ color: t.textDim, flexShrink: 0 }}>{count}</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                </>
+              )}
             </div>
           </div>
         </div>

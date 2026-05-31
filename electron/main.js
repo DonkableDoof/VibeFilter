@@ -255,6 +255,23 @@ ipcMain.on("file:reveal", (_e, filePath) => {
   if (filePath && fs.existsSync(filePath)) shell.showItemInFolder(filePath);
 });
 
+// ─── Change the window icon to match the chosen accent theme ───
+// Maps the accent names from the UI (theme.js ACCENTS) to icon files.
+const ACCENT_ICON_FILES = {
+  "Blue / Pink": "app-icon-blue-pink.png",
+  "Green / Lime": "app-icon-green-lime.png",
+  "Purple / Pink": "app-icon-purple-pink.png",
+  "Orange / Red": "app-icon-orange-red.png",
+  "Teal / Cyan": "app-icon-teal-cyan.png",
+};
+ipcMain.on("icon:set", (_e, accentName) => {
+  if (!win) return;
+  const file = ACCENT_ICON_FILES[accentName];
+  if (!file) return;
+  const iconPath = path.join(__dirname, "icons", file);
+  if (fs.existsSync(iconPath)) win.setIcon(iconPath);
+});
+
 // ─── Serve a file's bytes as a data URL for playback + cover display ───
 ipcMain.handle("file:read", (_e, filePath) => {
   try {

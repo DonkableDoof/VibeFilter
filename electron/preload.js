@@ -29,6 +29,9 @@ contextBridge.exposeInMainWorld("vf", {
   // Reveal in Finder/Explorer
   reveal: (filePath) => ipcRenderer.send("file:reveal", filePath),
 
+  // Change the window icon to match the chosen accent theme
+  setIcon: (accentName) => ipcRenderer.send("icon:set", accentName),
+
   // Build a playable/displayable URL for a local file
   fileUrl: (filePath) => `vfile://${encodeURIComponent(filePath)}`,
 });

@@ -5,6 +5,7 @@ import React from "react";
 // Driven by the active theme `t` so colors track dark/light mode.
 export const GlobalStyles = ({ t }) => (
   <style>{`
+    * { box-sizing: border-box; }
     .vf-scroll { scrollbar-width: thin; scrollbar-color: ${t.border} transparent; }
     .vf-scroll::-webkit-scrollbar { width: 10px; }
     .vf-scroll::-webkit-scrollbar-track { background: transparent; }
