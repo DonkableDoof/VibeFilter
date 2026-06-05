@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect, useMemo, useCallback } from "react";
 import { buildTheme, ACCENTS, TAG_PALETTE, DEFAULT_TAGS } from "./theme";
 import { Icon, ICONS } from "./icons.jsx";
-import { fmtTime, parseName } from "./helpers";
+import { fmtTime, parseName as parseNameBase } from "./helpers";
 import { makeStyles } from "./styles";
 import { GlobalStyles } from "./GlobalStyles.jsx";
 import { TooltipButton } from "./TooltipButton.jsx";
@@ -38,6 +38,7 @@ export default function App() {
   // Browsing (filter / search / which track is open)
   const [activeFilters, setActiveFilters] = useState([]);
   const [favsOnly, setFavsOnly] = useState(false);
+  const [hideUsed, setHideUsed] = useState(true); // hide tracks already dragged out, until reset
   const [search, setSearch] = useState("");
   const [selectedId, setSelectedId] = useState(null);
   const [dragOver, setDragOver] = useState(false);
@@ -58,6 +59,8 @@ export default function App() {
   const gainCache = useRef({});             // trackId -> loudness gain multiplier
   const playNextRef = useRef(() => {});     // always holds the latest "play next track" fn
   const waveCanvasRef = useRef(null);
+  const introStartRef = useRef(0);   // timestamp when the current wave-in began
+  const introRafRef = useRef(null);  // requestAnimationFrame id for the wave-in
 
   // Cover bank, bulk selection, popups
   const [bank, setBank] = useState([]);                       // [{ id, path }]
@@ -69,6 +72,8 @@ export default function App() {
   const [renaming, setRenaming] = useState(null);              // { trackId, title, artist } | null
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [hoverSlice, setHoverSlice] = useState(null); // index of hovered pie slice, or null
+  const dragTagIndex = useRef(null);                  // index of tag being dragged
+  const [dragOverTag, setDragOverTag] = useState(null); // index currently hovered during tag drag
 
   const isLight = settings.lightMode;
   const accentName = settings.accent || "Blue / Pink";
@@ -81,6 +86,9 @@ export default function App() {
   }[accentName] || "./app-icon.png";
   const tileSize = settings.tileSize || "medium";
   const setTileSize = (size) => setSettings((p) => ({ ...p, tileSize: size }));
+  const nameLast = !!settings.nameLast;
+  // Local wrapper so every parseName call in this file respects the name-format setting.
+  const parseName = (tr) => parseNameBase(tr, nameLast);
   const t = useMemo(() => buildTheme(isLight, accentName), [isLight, accentName]);
   const selected = tracks.find((tr) => tr.id === selectedId) || null;
 
@@ -175,8 +183,9 @@ export default function App() {
     return () => window.removeEventListener("keydown", onEsc);
   }, [ctxMenu]);
 
-  // Redraw the waveform whenever the peaks, playback progress, or theme change.
-  useEffect(() => {
+  // Draw the waveform. `intro` (0..1) animates bars growing in a left-to-right
+  // ripple; at 1 every bar is at full height.
+  const drawWave = useCallback((intro = 1) => {
     const canvas = waveCanvasRef.current;
     if (!canvas || !Array.isArray(peaks)) return;
     const dpr = window.devicePixelRatio || 1;
@@ -196,9 +205,17 @@ export default function App() {
     grad.addColorStop(0, t.green);
     grad.addColorStop(1, t.orange);
 
+    // Fraction of the total animation each bar takes; the rest is its staggered delay.
+    const barSpan = 0.45;
     for (let i = 0; i < n; i++) {
+      // Each bar's delay is based on its position (0 at left, up to 1-barSpan at right).
+      const delay = (i / (n - 1 || 1)) * (1 - barSpan);
+      let local = (intro - delay) / barSpan;       // this bar's own 0..1 progress
+      local = Math.max(0, Math.min(1, local));
+      const ease = 1 - Math.pow(1 - local, 3);      // ease-out cubic
+      const fullH = Math.max(2, peaks[i] * cssH * 0.92);
+      const h = Math.max(2, fullH * ease);
       const x = i * (barW + gap);
-      const h = Math.max(2, peaks[i] * cssH * 0.92);
       const y = (cssH - h) / 2;
       const played = x + barW / 2 <= playedX;
       ctx.fillStyle = played ? grad : t.border;
@@ -212,7 +229,34 @@ export default function App() {
       ctx.closePath();
       ctx.fill();
     }
-  }, [peaks, curTime, duration, t, selectedId]);
+  }, [peaks, curTime, duration, t]);
+
+  // Static redraw on progress/theme/peaks change (no animation — intro stays at 1).
+  useEffect(() => {
+    if (introRafRef.current) return; // skip while a wave-in animation is running
+    drawWave(1);
+  }, [drawWave]);
+
+  // Trigger the left-to-right wave-in whenever a new track's peaks arrive.
+  useEffect(() => {
+    if (!Array.isArray(peaks)) return;
+    if (introRafRef.current) cancelAnimationFrame(introRafRef.current);
+    introStartRef.current = performance.now();
+    const DURATION = 650; // ms for the full ripple
+    const step = (now) => {
+      const intro = Math.min(1, (now - introStartRef.current) / DURATION);
+      drawWave(intro);
+      if (intro < 1) {
+        introRafRef.current = requestAnimationFrame(step);
+      } else {
+        introRafRef.current = null;
+      }
+    };
+    introRafRef.current = requestAnimationFrame(step);
+    return () => {
+      if (introRafRef.current) { cancelAnimationFrame(introRafRef.current); introRafRef.current = null; }
+    };
+  }, [selectedId, peaks]);
 
   // ── 3. Playback ───────────────────────────────────────────────────────────
   // Effective volume = slider × per-track loudness gain, clamped to 0..1.
@@ -372,6 +416,16 @@ export default function App() {
   const setTagColor = (tagId, color) => {
     setTags((prev) => prev.map((tg) => (tg.id === tagId ? { ...tg, color } : tg)));
   };
+  // Move a tag from one index to another (used by drag-to-reorder).
+  const reorderTags = (from, to) => {
+    if (from === to || from == null || to == null) return;
+    setTags((prev) => {
+      const next = [...prev];
+      const [moved] = next.splice(from, 1);
+      next.splice(to, 0, moved);
+      return next;
+    });
+  };
   const removeTag = (tagId) => {
     setTags((prev) => prev.filter((tg) => tg.id !== tagId));
     setTracks((prev) => prev.map((tr) => ({ ...tr, tags: tr.tags.filter((x) => x !== tagId) })));
@@ -442,7 +496,8 @@ export default function App() {
       const matchSearch = hay.includes(search.toLowerCase());
       const matchTags = activeFilters.every((f) => tr.tags.includes(f));
       const matchFavs = !favsOnly || tr.favourite;
-      return matchSearch && matchTags && matchFavs;
+      const matchUsed = !hideUsed || !tr.used;
+      return matchSearch && matchTags && matchFavs && matchUsed;
     })
     .sort((a, b) => {
       const pa = parseName(a), pb = parseName(b);
@@ -457,6 +512,7 @@ export default function App() {
 
   // Total duration of the whole library, rounded to whole minutes.
   const totalMinutes = Math.round(tracks.reduce((sum, tr) => sum + (tr.durationSec || 0), 0) / 60);
+  const usedCount = tracks.filter((tr) => tr.used).length;
 
   // Track counts grouped by artist/game, most tracks first (for the Settings stats).
   const artistCounts = (() => {
@@ -544,10 +600,15 @@ export default function App() {
   };
   const exitSelectMode = () => { setSelectMode(false); setSelectedTracks(new Set()); };
 
-  // Hand a track off to the OS so it can be dragged into Premiere / Explorer.
+  // Hand a track off to the OS so it can be dragged into Premiere / Explorer,
+  // and mark it "used" so it can be hidden until the user resets.
   const onTrackDragStart = (e, tr) => {
     e.preventDefault();
     window.vf.startDrag(tr.filePath);
+    setTracks((prev) => prev.map((x) => (x.id === tr.id ? { ...x, used: true } : x)));
+  };
+  const resetUsed = () => {
+    setTracks((prev) => prev.map((tr) => (tr.used ? { ...tr, used: false } : tr)));
   };
 
   // ── 7. Render ─────────────────────────────────────────────────────────────
@@ -605,6 +666,19 @@ export default function App() {
               Clear filters
             </div>
           )}
+          <div style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 10 }}>
+            <span onClick={() => setHideUsed((v) => !v)}
+              title={hideUsed ? "Used tracks are hidden" : "Used tracks are shown"}
+              style={{ ...s.chip(hideUsed, t.green), padding: "5px 10px", gap: 6 }}>
+              <Icon d={ICONS.check} size={13} /> Hide used
+            </span>
+            {usedCount > 0 && (
+              <span onClick={resetUsed}
+                style={{ fontSize: 12, color: t.green, cursor: "pointer", fontWeight: 600 }}>
+                Reset used ({usedCount})
+              </span>
+            )}
+          </div>
         </div>
 
         <div style={s.section}>
@@ -617,18 +691,32 @@ export default function App() {
             <Icon d={ICONS.plus} size={15} /> Add tag
           </button>
           <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
-            {tags.map((tg) => (
-              <div key={tg.id} style={{ display: "flex", alignItems: "center", gap: 9, fontSize: 13 }}>
+            {tags.map((tg, i) => (
+              <div key={tg.id}
+                draggable
+                onDragStart={() => { dragTagIndex.current = i; }}
+                onDragOver={(e) => { e.preventDefault(); setDragOverTag(i); }}
+                onDragLeave={() => setDragOverTag((cur) => (cur === i ? null : cur))}
+                onDrop={(e) => { e.preventDefault(); reorderTags(dragTagIndex.current, i); dragTagIndex.current = null; setDragOverTag(null); }}
+                onDragEnd={() => { dragTagIndex.current = null; setDragOverTag(null); }}
+                style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 13,
+                  padding: "2px 0", borderRadius: 6,
+                  borderTop: `2px solid ${dragOverTag === i && dragTagIndex.current !== null ? t.green : "transparent"}` }}>
+                <span style={{ cursor: "grab", color: t.textDim, display: "grid", placeItems: "center", flexShrink: 0 }}
+                  title="Drag to reorder">
+                  <Icon d={ICONS.grip} size={14} />
+                </span>
                 <input type="color" className="vf-swatch" value={tg.color}
                   title="Change colour"
                   onChange={(e) => setTagColor(tg.id, e.target.value)}
                   style={{ width: 16, height: 16, flexShrink: 0, borderRadius: 5 }} />
-                <span style={{ flex: 1, color: t.textMuted }}>{tg.label}</span>
+                <span style={{ flex: 1, color: t.textMuted, whiteSpace: "nowrap",
+                  overflow: "hidden", textOverflow: "ellipsis" }}>{tg.label}</span>
                 <span onClick={() => removeTag(tg.id)}
                   title="Delete tag"
                   onMouseEnter={(e) => (e.currentTarget.style.color = t.textMuted)}
                   onMouseLeave={(e) => (e.currentTarget.style.color = t.textDim)}
-                  style={{ cursor: "pointer", color: t.textDim, display: "grid", placeItems: "center" }}>
+                  style={{ cursor: "pointer", color: t.textDim, display: "grid", placeItems: "center", flexShrink: 0 }}>
                   <Icon d={ICONS.x} size={14} />
                 </span>
               </div>
@@ -741,7 +829,10 @@ export default function App() {
         )}
 
         <div style={s.content}>
-          <div style={s.list} className="vf-scroll"
+          <div className="vf-scroll"
+            style={{ ...s.list,
+              outline: dragOver && !empty ? `3px solid ${t.green}` : "3px solid transparent",
+              outlineOffset: -3, borderRadius: 12, transition: "outline-color 0.12s" }}
             onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
             onDragLeave={() => setDragOver(false)}
             onDrop={onDrop}>
@@ -760,13 +851,6 @@ export default function App() {
               </div>
             ) : (
               <>
-                {dragOver && (
-                  <div style={{ padding: 12, marginBottom: 12, borderRadius: 10,
-                    border: `2px dashed ${t.green}`, color: t.green, textAlign: "center",
-                    fontSize: 13, fontWeight: 600, background: t.accentBg }}>
-                    Drop to add more tracks
-                  </div>
-                )}
                 {filtered.length === 0 ? (
                   <div style={{ color: t.textMuted, fontSize: 14, padding: 20 }}>
                     No tracks match these filters.
@@ -793,6 +877,7 @@ export default function App() {
                               : {}),
                             cursor: selectMode ? "pointer" : "grab",
                             outline: "none",
+                            opacity: tr.used && !active ? 0.45 : 1,
                           }}
                           draggable={!selectMode}
                           onDragStart={(e) => onTrackDragStart(e, tr)}
@@ -820,6 +905,15 @@ export default function App() {
                                 borderRadius: "50%", display: "grid", placeItems: "center",
                                 background: "rgba(0,0,0,0.45)", color: "#facc15" }}>
                                 <Icon d={ICONS.star} size={14} fill="currentColor" />
+                              </div>
+                            )}
+                            {!selectMode && tr.used && (
+                              <div title="Used"
+                                style={{
+                                  position: "absolute", top: 8, left: 8, width: 24, height: 24,
+                                  borderRadius: "50%", display: "grid", placeItems: "center",
+                                  background: t.green, color: "#fff", boxShadow: "0 1px 4px rgba(0,0,0,0.35)" }}>
+                                <Icon d={ICONS.check} size={14} />
                               </div>
                             )}
                           </div>
@@ -873,8 +967,18 @@ export default function App() {
 
                 {(() => { const { title, artist } = parseName(selected); return (
                   <>
-                    <div style={{ fontSize: 17, fontWeight: 700, letterSpacing: -0.3, marginBottom: 2 }}>{title}</div>
-                    <div style={{ fontSize: 12.5, color: t.textDim, marginBottom: 18 }}>{artist || selected.fileName}</div>
+                    <div onClick={() => setRenaming({ trackId: selected.id, title: title || "", artist: artist || "" })}
+                      title="Click to rename"
+                      onMouseEnter={(e) => (e.currentTarget.style.textDecoration = "underline")}
+                      onMouseLeave={(e) => (e.currentTarget.style.textDecoration = "none")}
+                      style={{ fontSize: 17, fontWeight: 700, letterSpacing: -0.3, marginBottom: 2,
+                        cursor: "pointer" }}>{title}</div>
+                    <div onClick={() => setRenaming({ trackId: selected.id, title: title || "", artist: artist || "" })}
+                      title="Click to rename"
+                      onMouseEnter={(e) => (e.currentTarget.style.textDecoration = "underline")}
+                      onMouseLeave={(e) => (e.currentTarget.style.textDecoration = "none")}
+                      style={{ fontSize: 12.5, color: t.textDim, marginBottom: 18, cursor: "pointer",
+                        display: "inline-block" }}>{artist || selected.fileName}</div>
                   </>
                 ); })()}
 
@@ -1048,9 +1152,9 @@ export default function App() {
 
       {addTagOpen && (
         <div onClick={() => setAddTagOpen(false)}
-          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)",
+          className="vf-overlay" style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)",
             display: "grid", placeItems: "center", zIndex: 70 }}>
-          <div onClick={(e) => e.stopPropagation()}
+          <div className="vf-card" onClick={(e) => e.stopPropagation()}
             style={{ width: 340, maxWidth: "90vw", background: t.bgCard, borderRadius: 14,
               border: `1px solid ${t.border}`, padding: 22, boxShadow: "0 20px 60px rgba(0,0,0,0.4)" }}>
             <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 16 }}>New tag</div>
@@ -1089,9 +1193,9 @@ export default function App() {
 
       {renaming && (
         <div onClick={() => setRenaming(null)}
-          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)",
+          className="vf-overlay" style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)",
             display: "grid", placeItems: "center", zIndex: 70 }}>
-          <div onClick={(e) => e.stopPropagation()}
+          <div className="vf-card" onClick={(e) => e.stopPropagation()}
             style={{ width: 380, maxWidth: "90vw", background: t.bgCard, borderRadius: 14,
               border: `1px solid ${t.border}`, padding: 22, boxShadow: "0 20px 60px rgba(0,0,0,0.4)" }}>
             <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 4 }}>Rename track</div>
@@ -1132,9 +1236,9 @@ export default function App() {
 
       {settingsOpen && (
         <div onClick={() => setSettingsOpen(false)}
-          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)",
+          className="vf-overlay" style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)",
             display: "grid", placeItems: "center", zIndex: 70 }}>
-          <div onClick={(e) => e.stopPropagation()}
+          <div className="vf-card" onClick={(e) => e.stopPropagation()}
             style={{ width: 460, maxWidth: "92vw", maxHeight: "85vh", background: t.bgCard,
               borderRadius: 16, border: `1px solid ${t.border}`, display: "flex", flexDirection: "column",
               overflow: "hidden", boxShadow: "0 20px 60px rgba(0,0,0,0.4)" }}>
@@ -1168,6 +1272,27 @@ export default function App() {
                     background: isLight ? t.accentBg : t.bgCard2,
                     color: isLight ? t.green : t.textMuted }}>
                   <Icon d={ICONS.sun} size={15} /> Light
+                </button>
+              </div>
+
+              {/* Filename format */}
+              <div style={s.label}>Filename format</div>
+              <div style={{ display: "flex", gap: 8, marginBottom: 22 }}>
+                <button onClick={() => setSettings((p) => ({ ...p, nameLast: false }))}
+                  style={{ flex: 1, padding: "10px", borderRadius: 10, cursor: "pointer", fontFamily: "inherit",
+                    fontSize: 12.5, fontWeight: 600,
+                    border: `1px solid ${!nameLast ? t.green : t.border}`,
+                    background: !nameLast ? t.accentBg : t.bgCard2,
+                    color: !nameLast ? t.green : t.textMuted }}>
+                  Artist - Name
+                </button>
+                <button onClick={() => setSettings((p) => ({ ...p, nameLast: true }))}
+                  style={{ flex: 1, padding: "10px", borderRadius: 10, cursor: "pointer", fontFamily: "inherit",
+                    fontSize: 12.5, fontWeight: 600,
+                    border: `1px solid ${nameLast ? t.green : t.border}`,
+                    background: nameLast ? t.accentBg : t.bgCard2,
+                    color: nameLast ? t.green : t.textMuted }}>
+                  Name - Artist
                 </button>
               </div>
 
@@ -1305,9 +1430,9 @@ export default function App() {
 
       {bankOpen && (
         <div onClick={() => { setBankOpen(false); setBankTargetTrack(null); }}
-          style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)",
+          className="vf-overlay" style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)",
             display: "grid", placeItems: "center", zIndex: 50 }}>
-          <div onClick={(e) => e.stopPropagation()}
+          <div className="vf-card" onClick={(e) => e.stopPropagation()}
             style={{ width: 620, maxWidth: "90vw", maxHeight: "82vh", background: t.bgCard,
               borderRadius: 16, border: `1px solid ${t.border}`, display: "flex",
               flexDirection: "column", overflow: "hidden", boxShadow: "0 20px 60px rgba(0,0,0,0.4)" }}>

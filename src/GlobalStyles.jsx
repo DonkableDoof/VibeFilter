@@ -32,5 +32,9 @@ export const GlobalStyles = ({ t }) => (
     .vf-swatch { -webkit-appearance: none; appearance: none; border: none; padding: 0; cursor: pointer; background: none; }
     .vf-swatch::-webkit-color-swatch-wrapper { padding: 0; }
     .vf-swatch::-webkit-color-swatch { border: 1px solid rgba(128,128,128,0.4); border-radius: 5px; }
+    @keyframes vfOverlayIn { from { opacity: 0; } to { opacity: 1; } }
+    @keyframes vfCardIn { from { opacity: 0; transform: translateY(36px); } to { opacity: 1; transform: translateY(0); } }
+    .vf-overlay { animation: vfOverlayIn 0.16s ease-out; }
+    .vf-card { animation: vfCardIn 0.42s cubic-bezier(0.16, 1, 0.3, 1); }
   `}</style>
 );

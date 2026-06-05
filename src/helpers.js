@@ -22,14 +22,25 @@ export const contrastText = (hex) => {
 
 // Resolve a track's display title and artist, in priority order:
 //   0. user-set rename overrides (customTitle / customArtist) always win
-//   1. a filename shaped like "Artist - Name"
+//   1. a filename shaped like "Artist - Name" (or "Name - Artist" if nameLast)
 //   2. embedded file metadata (title / artist)
 //   3. the raw filename as the title
-export const parseName = (tr) => {
+// `nameLast` swaps the filename interpretation: when true, the part AFTER the
+// dash is treated as the artist/game and the part BEFORE it as the track name.
+export const parseName = (tr, nameLast = false) => {
+  // If the user has manually renamed either field, treat this track as fixed and
+  // don't let the filename-format swap reinterpret it.
+  const hasCustom =
+    (tr.customTitle != null && tr.customTitle !== "") ||
+    (tr.customArtist != null && tr.customArtist !== "");
+  const useSwap = nameLast && !hasCustom;
   const base = (() => {
     const raw = tr.name;
     const m = raw.match(/^(.*?)\s*[-–—]\s*(.+)$/);
-    if (m && m[1].trim() && m[2].trim()) return { title: m[2].trim(), artist: m[1].trim() };
+    if (m && m[1].trim() && m[2].trim()) {
+      const a = m[1].trim(), b = m[2].trim();
+      return useSwap ? { title: a, artist: b } : { title: b, artist: a };
+    }
     if (tr.metaTitle) return { title: tr.metaTitle, artist: tr.metaArtist || null };
     return { title: raw, artist: tr.metaArtist || null };
   })();
