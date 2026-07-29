@@ -255,6 +255,11 @@ ipcMain.on("file:reveal", (_e, filePath) => {
   if (filePath && fs.existsSync(filePath)) shell.showItemInFolder(filePath);
 });
 
+// ─── Open a URL in the user's default browser ───
+ipcMain.on("url:open", (_e, url) => {
+  if (typeof url === "string" && /^https?:\/\//.test(url)) shell.openExternal(url);
+});
+
 // ─── Change the window icon to match the chosen accent theme ───
 // Maps the accent names from the UI (theme.js ACCENTS) to icon files.
 const ACCENT_ICON_FILES = {

@@ -5,6 +5,7 @@ import { fmtTime, parseName as parseNameBase } from "./helpers";
 import { makeStyles } from "./styles";
 import { GlobalStyles } from "./GlobalStyles.jsx";
 import { TooltipButton } from "./TooltipButton.jsx";
+import { fetchLatestRelease, isNewer, REPO_URL } from "./updateCheck";
 
 /*
   VibeFilter (Electron build)
@@ -36,7 +37,8 @@ export default function App() {
   const [tags, setTags] = useState(DEFAULT_TAGS);
 
   // Browsing (filter / search / which track is open)
-  const [activeFilters, setActiveFilters] = useState([]);
+  const [activeFilters, setActiveFilters] = useState([]);   // tags that must be present
+  const [excludedFilters, setExcludedFilters] = useState([]); // tags that must be absent
   const [favsOnly, setFavsOnly] = useState(false);
   const [hideUsed, setHideUsed] = useState(true); // hide tracks already dragged out, until reset
   const [search, setSearch] = useState("");
@@ -71,6 +73,9 @@ export default function App() {
   const [ctxMenu, setCtxMenu] = useState(null);                 // { x, y, trackId } | null
   const [renaming, setRenaming] = useState(null);              // { trackId, title, artist } | null
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [updateVersion, setUpdateVersion] = useState(null); // newer release tag, or null
+  const [updateDismissed, setUpdateDismissed] = useState(false);
+  const [creditsCopied, setCreditsCopied] = useState(false);
   const [hoverSlice, setHoverSlice] = useState(null); // index of hovered pie slice, or null
   const dragTagIndex = useRef(null);                  // index of tag being dragged
   const [dragOverTag, setDragOverTag] = useState(null); // index currently hovered during tag drag
@@ -125,6 +130,14 @@ export default function App() {
   useEffect(() => {
     if (window.vf.setIcon) window.vf.setIcon(accentName);
   }, [accentName]);
+
+  // On startup, check GitHub for a newer release (silent if offline).
+  useEffect(() => {
+    (async () => {
+      const latest = await fetchLatestRelease();
+      if (latest && isNewer(latest, __APP_VERSION__)) setUpdateVersion(latest);
+    })();
+  }, []);
 
   // Keep the <audio> element's volume in sync with the slider + per-track gain.
   useEffect(() => {
@@ -430,9 +443,29 @@ export default function App() {
     setTags((prev) => prev.filter((tg) => tg.id !== tagId));
     setTracks((prev) => prev.map((tr) => ({ ...tr, tags: tr.tags.filter((x) => x !== tagId) })));
     setActiveFilters((prev) => prev.filter((x) => x !== tagId));
+    setExcludedFilters((prev) => prev.filter((x) => x !== tagId));
   };
-  const toggleFilter = (tagId) =>
+
+  // Filter chips are tri-state: neutral → included → (right-click) excluded.
+  // Left click: an excluded chip becomes included; otherwise toggle neutral/included.
+  const toggleFilter = (tagId) => {
+    if (excludedFilters.includes(tagId)) {
+      setExcludedFilters((prev) => prev.filter((x) => x !== tagId));
+      setActiveFilters((prev) => (prev.includes(tagId) ? prev : [...prev, tagId]));
+      return;
+    }
     setActiveFilters((prev) => (prev.includes(tagId) ? prev.filter((x) => x !== tagId) : [...prev, tagId]));
+  };
+  // Right click: an excluded chip returns to neutral; otherwise it becomes excluded.
+  const excludeFilter = (tagId) => {
+    if (excludedFilters.includes(tagId)) {
+      setExcludedFilters((prev) => prev.filter((x) => x !== tagId));
+      return;
+    }
+    setActiveFilters((prev) => prev.filter((x) => x !== tagId));
+    setExcludedFilters((prev) => [...prev, tagId]);
+  };
+  const clearFilters = () => { setActiveFilters([]); setExcludedFilters([]); setFavsOnly(false); };
 
   const toggleFavourite = (id) => {
     setTracks((prev) => prev.map((tr) =>
@@ -495,9 +528,10 @@ export default function App() {
       const hay = (title + " " + (artist || "") + " " + tr.name).toLowerCase();
       const matchSearch = hay.includes(search.toLowerCase());
       const matchTags = activeFilters.every((f) => tr.tags.includes(f));
+      const matchExcluded = excludedFilters.every((f) => !tr.tags.includes(f));
       const matchFavs = !favsOnly || tr.favourite;
       const matchUsed = !hideUsed || !tr.used;
-      return matchSearch && matchTags && matchFavs && matchUsed;
+      return matchSearch && matchTags && matchExcluded && matchFavs && matchUsed;
     })
     .sort((a, b) => {
       const pa = parseName(a), pb = parseName(b);
@@ -513,6 +547,31 @@ export default function App() {
   // Total duration of the whole library, rounded to whole minutes.
   const totalMinutes = Math.round(tracks.reduce((sum, tr) => sum + (tr.durationSec || 0), 0) / 60);
   const usedCount = tracks.filter((tr) => tr.used).length;
+
+  // "Title — Artist" lines for every used track, sorted by artist then title.
+  // Handy for pasting into a YouTube description.
+  const creditsText = () =>
+    tracks
+      .filter((tr) => tr.used)
+      .map((tr) => parseName(tr))
+      .sort((a, b) => {
+        const byArtist = (a.artist || "").localeCompare(b.artist || "", undefined, { sensitivity: "base" });
+        return byArtist !== 0 ? byArtist : a.title.localeCompare(b.title, undefined, { sensitivity: "base" });
+      })
+      .map(({ title, artist }) => (artist ? `${artist} — ${title}` : title))
+      .join("\n");
+
+  const copyCredits = async () => {
+    const text = creditsText();
+    if (!text) return;
+    try {
+      await navigator.clipboard.writeText(text);
+      setCreditsCopied(true);
+      setTimeout(() => setCreditsCopied(false), 1800);
+    } catch {
+      setCreditsCopied(false);
+    }
+  };
 
   // Track counts grouped by artist/game, most tracks first (for the Settings stats).
   const artistCounts = (() => {
@@ -605,10 +664,23 @@ export default function App() {
   const onTrackDragStart = (e, tr) => {
     e.preventDefault();
     window.vf.startDrag(tr.filePath);
-    setTracks((prev) => prev.map((x) => (x.id === tr.id ? { ...x, used: true } : x)));
+    // usedAt lets "Undo use" find the most recently used track, even after a restart.
+    setTracks((prev) => prev.map((x) => (x.id === tr.id ? { ...x, used: true, usedAt: Date.now() } : x)));
   };
   const resetUsed = () => {
-    setTracks((prev) => prev.map((tr) => (tr.used ? { ...tr, used: false } : tr)));
+    setTracks((prev) => prev.map((tr) => (tr.used ? { ...tr, used: false, usedAt: null } : tr)));
+  };
+  // Mark a single track used / unused (from the right-click menu).
+  const setTrackUsed = (id, used) => {
+    setTracks((prev) => prev.map((tr) =>
+      tr.id === id ? { ...tr, used, usedAt: used ? Date.now() : null } : tr));
+  };
+  // Un-use whichever track was used most recently.
+  const undoLastUse = () => {
+    const used = tracks.filter((tr) => tr.used);
+    if (used.length === 0) return;
+    const latest = used.reduce((a, b) => ((b.usedAt || 0) > (a.usedAt || 0) ? b : a));
+    setTrackUsed(latest.id, false);
   };
 
   // ── 7. Render ─────────────────────────────────────────────────────────────
@@ -650,28 +722,54 @@ export default function App() {
               onClick={() => setFavsOnly((v) => !v)}>
               <Icon d={ICONS.star} size={14} fill={favsOnly ? "currentColor" : "none"} />
             </span>
-            {tags.map((tg) => (
-              <span key={tg.id} style={s.chip(activeFilters.includes(tg.id), tg.color)}
-                onClick={() => toggleFilter(tg.id)}>
-                {tg.label}
-              </span>
-            ))}
+            {tags.map((tg) => {
+              const included = activeFilters.includes(tg.id);
+              const excluded = excludedFilters.includes(tg.id);
+              return (
+                <span key={tg.id}
+                  title={excluded
+                    ? "Excluded — left click to include, right click to reset"
+                    : included
+                    ? "Included — left click to reset, right click to exclude"
+                    : "Left click to include, right click to exclude"}
+                  style={{
+                    ...s.chip(included, tg.color),
+                    ...(excluded ? {
+                      background: "transparent",
+                      color: tg.color,
+                      border: `1px dashed ${tg.color}`,
+                      textDecoration: "line-through",
+                      opacity: 0.85,
+                    } : {}),
+                  }}
+                  onClick={() => toggleFilter(tg.id)}
+                  onContextMenu={(e) => { e.preventDefault(); excludeFilter(tg.id); }}>
+                  {tg.label}
+                </span>
+              );
+            })}
             {tags.length === 0 && (
               <span style={{ fontSize: 12.5, color: t.textDim, alignSelf: "center" }}>No tags yet.</span>
             )}
           </div>
-          {(activeFilters.length > 0 || favsOnly) && (
-            <div onClick={() => { setActiveFilters([]); setFavsOnly(false); }}
+          {(activeFilters.length > 0 || excludedFilters.length > 0 || favsOnly) && (
+            <div onClick={clearFilters}
               style={{ marginTop: 10, fontSize: 12, color: t.green, cursor: "pointer", fontWeight: 600 }}>
               Clear filters
             </div>
           )}
-          <div style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 10 }}>
+          <div style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 7, flexWrap: "wrap" }}>
             <span onClick={() => setHideUsed((v) => !v)}
               title={hideUsed ? "Used tracks are hidden" : "Used tracks are shown"}
               style={{ ...s.chip(hideUsed, t.green), padding: "5px 10px", gap: 6 }}>
               <Icon d={ICONS.check} size={13} /> Hide used
             </span>
+            {usedCount > 0 && (
+              <span onClick={undoLastUse} title="Un-use the most recently used track"
+                style={{ ...s.chip(false, t.green), padding: "5px 10px", gap: 6 }}>
+                <Icon d={ICONS.undo} size={13} /> Undo use
+              </span>
+            )}
             {usedCount > 0 && (
               <span onClick={resetUsed}
                 style={{ fontSize: 12, color: t.green, cursor: "pointer", fontWeight: 600 }}>
@@ -754,6 +852,24 @@ export default function App() {
       </aside>
 
       <div style={s.main}>
+        {updateVersion && !updateDismissed && (
+          <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 24px",
+            background: t.accentBg, borderBottom: `1px solid ${t.green}`, fontSize: 13 }}>
+            <Icon d={ICONS.upload} size={15} />
+            <span style={{ flex: 1, color: t.text }}>
+              A new version of VibeFilter ({updateVersion}) is available.
+            </span>
+            <button onClick={() => window.vf.openUrl(REPO_URL)}
+              style={{ padding: "6px 12px", borderRadius: 8, border: "none", cursor: "pointer",
+                background: t.green, color: "#fff", fontSize: 12.5, fontWeight: 600, fontFamily: "inherit" }}>
+              View on GitHub
+            </button>
+            <span onClick={() => setUpdateDismissed(true)} title="Dismiss"
+              style={{ cursor: "pointer", color: t.textMuted, display: "grid", placeItems: "center" }}>
+              <Icon d={ICONS.x} size={16} />
+            </span>
+          </div>
+        )}
         <div style={s.topbar}>
           <div style={s.searchWrap}>
             <Icon d={ICONS.search} size={16} />
@@ -1109,7 +1225,7 @@ export default function App() {
             style={{ position: "fixed", inset: 0, zIndex: 60 }} />
           <div style={{
             position: "fixed", left: Math.min(ctxMenu.x, window.innerWidth - 200),
-            top: Math.min(ctxMenu.y, window.innerHeight - 190), zIndex: 61,
+            top: Math.min(ctxMenu.y, window.innerHeight - 230), zIndex: 61,
             background: t.bgCard, border: `1px solid ${t.border}`, borderRadius: 10,
             boxShadow: "0 10px 30px rgba(0,0,0,0.35)", padding: 5, minWidth: 180 }}>
             <button
@@ -1119,6 +1235,14 @@ export default function App() {
               style={{ ...itemBase, color: ctxTrack && ctxTrack.favourite ? "#eab308" : t.text }}>
               <Icon d={ICONS.star} size={15} fill={ctxTrack && ctxTrack.favourite ? "currentColor" : "none"} />
               {ctxTrack && ctxTrack.favourite ? "Unfavourite" : "Favourite"}
+            </button>
+            <button
+              onClick={() => { setTrackUsed(ctxMenu.trackId, !(ctxTrack && ctxTrack.used)); setCtxMenu(null); }}
+              onMouseEnter={(e) => (e.currentTarget.style.background = t.bgHover)}
+              onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+              style={{ ...itemBase, color: ctxTrack && ctxTrack.used ? t.green : t.text }}>
+              <Icon d={ctxTrack && ctxTrack.used ? ICONS.undo : ICONS.check} size={15} />
+              {ctxTrack && ctxTrack.used ? "Mark as unused" : "Mark as used"}
             </button>
             <button
               onClick={() => {
@@ -1336,6 +1460,25 @@ export default function App() {
                   <div style={{ fontSize: 24, fontWeight: 700, color: t.text }}>{artistCounts.length}</div>
                   <div style={{ fontSize: 12, color: t.textDim }}>artists</div>
                 </div>
+              </div>
+
+              {/* Credits for used tracks */}
+              <div style={s.label}>Credits</div>
+              <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 20 }}>
+                <button onClick={copyCredits} disabled={usedCount === 0}
+                  style={{ display: "inline-flex", alignItems: "center", gap: 8, padding: "9px 14px",
+                    borderRadius: 9, border: "none", fontFamily: "inherit", fontSize: 13, fontWeight: 600,
+                    cursor: usedCount ? "pointer" : "not-allowed",
+                    background: usedCount ? t.green : t.bgCard2,
+                    color: usedCount ? "#fff" : t.textDim }}>
+                  <Icon d={creditsCopied ? ICONS.check : ICONS.clipboard} size={15} />
+                  {creditsCopied ? "Copied!" : "Copy credits"}
+                </button>
+                <span style={{ fontSize: 12.5, color: t.textDim }}>
+                  {usedCount > 0
+                    ? `${usedCount} used track${usedCount !== 1 ? "s" : ""}`
+                    : "No used tracks yet"}
+                </span>
               </div>
 
               {/* Per-artist breakdown */}
