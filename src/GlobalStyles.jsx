@@ -32,8 +32,23 @@ export const GlobalStyles = ({ t }) => (
     .vf-swatch { -webkit-appearance: none; appearance: none; border: none; padding: 0; cursor: pointer; background: none; }
     .vf-swatch::-webkit-color-swatch-wrapper { padding: 0; }
     .vf-swatch::-webkit-color-swatch { border: 1px solid rgba(128,128,128,0.4); border-radius: 5px; }
-    @keyframes vfOverlayIn { from { opacity: 0; } to { opacity: 1; } }
-    @keyframes vfCardIn { from { opacity: 0; transform: translateY(36px); } to { opacity: 1; transform: translateY(0); } }
+
+    /* Interaction feedback: buttons and chips lift on hover and press down on click. */
+    button { transition: transform 0.12s ease, background-color 0.15s ease,
+             border-color 0.15s ease, color 0.15s ease, opacity 0.15s ease; }
+    button:not(:disabled):hover { transform: translateY(-1px); }
+    button:not(:disabled):active { transform: translateY(0) scale(0.95); }
+    .vf-chip { transition: transform 0.12s ease, background-color 0.15s ease,
+               border-color 0.15s ease, color 0.15s ease; }
+    .vf-chip:hover { transform: translateY(-1px); }
+    .vf-chip:active { transform: scale(0.94); }
+    .vf-tile:hover { transform: translateY(-3px); }
+    .vf-tile:active { transform: translateY(-1px) scale(0.99); }
+    @media (prefers-reduced-motion: reduce) {
+      button, .vf-chip, .vf-tile, .vf-card, .vf-overlay { transition: none !important; animation: none !important; }
+      button:hover, .vf-chip:hover, .vf-tile:hover { transform: none !important; }
+    }
+    @keyframes vfOverlayIn { from { opacity: 0; } to { opacity: 1; } }    @keyframes vfCardIn { from { opacity: 0; transform: translateY(36px); } to { opacity: 1; transform: translateY(0); } }
     .vf-overlay { animation: vfOverlayIn 0.16s ease-out; }
     .vf-card { animation: vfCardIn 0.42s cubic-bezier(0.16, 1, 0.3, 1); }
   `}</style>

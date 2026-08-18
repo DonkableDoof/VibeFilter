@@ -76,6 +76,7 @@ export default function App() {
   const [updateVersion, setUpdateVersion] = useState(null); // newer release tag, or null
   const [updateDismissed, setUpdateDismissed] = useState(false);
   const [creditsCopied, setCreditsCopied] = useState(false);
+  const [winW, setWinW] = useState(typeof window !== "undefined" ? window.innerWidth : 1200);
   const [hoverSlice, setHoverSlice] = useState(null); // index of hovered pie slice, or null
   const dragTagIndex = useRef(null);                  // index of tag being dragged
   const [dragOverTag, setDragOverTag] = useState(null); // index currently hovered during tag drag
@@ -92,6 +93,8 @@ export default function App() {
   const tileSize = settings.tileSize || "medium";
   const setTileSize = (size) => setSettings((p) => ({ ...p, tileSize: size }));
   const nameLast = !!settings.nameLast;
+  const loopEnabled = settings.loop !== false; // default on
+  const toggleLoop = () => setSettings((p) => ({ ...p, loop: !(p.loop !== false) }));
   // Local wrapper so every parseName call in this file respects the name-format setting.
   const parseName = (tr) => parseNameBase(tr, nameLast);
   const t = useMemo(() => buildTheme(isLight, accentName), [isLight, accentName]);
@@ -188,6 +191,17 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, [selected, isPlaying, duration, renaming]);
 
+  // Track window size so the layout can adapt, throttled to one update per frame.
+  useEffect(() => {
+    let raf = null;
+    const onResize = () => {
+      if (raf) return;
+      raf = requestAnimationFrame(() => { raf = null; setWinW(window.innerWidth); });
+    };
+    window.addEventListener("resize", onResize);
+    return () => { window.removeEventListener("resize", onResize); if (raf) cancelAnimationFrame(raf); };
+  }, []);
+
   // Escape closes the right-click menu.
   useEffect(() => {
     if (!ctxMenu) return;
@@ -203,14 +217,19 @@ export default function App() {
     if (!canvas || !Array.isArray(peaks)) return;
     const dpr = window.devicePixelRatio || 1;
     const cssW = canvas.clientWidth, cssH = canvas.clientHeight;
-    canvas.width = cssW * dpr; canvas.height = cssH * dpr;
+    // Nothing to draw if the panel has been collapsed to nothing.
+    if (cssW <= 0 || cssH <= 0) return;
+    canvas.width = Math.max(1, Math.round(cssW * dpr));
+    canvas.height = Math.max(1, Math.round(cssH * dpr));
     const ctx = canvas.getContext("2d");
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, cssW, cssH);
 
     const n = peaks.length;
-    const gap = 2;
-    const barW = (cssW - gap * (n - 1)) / n;
+    // Shrink the gap on very narrow panels so bars never end up with a
+    // negative width (a negative arc radius throws and would blank the app).
+    const gap = cssW / n > 3 ? 2 : 0;
+    const barW = Math.max(0.5, (cssW - gap * (n - 1)) / n);
     const progress = duration ? curTime / duration : 0;
     const playedX = progress * cssW;
 
@@ -232,7 +251,7 @@ export default function App() {
       const y = (cssH - h) / 2;
       const played = x + barW / 2 <= playedX;
       ctx.fillStyle = played ? grad : t.border;
-      const r = Math.min(barW / 2, 2);
+      const r = Math.max(0, Math.min(barW / 2, 2)); // never negative
       ctx.beginPath();
       ctx.moveTo(x + r, y);
       ctx.arcTo(x + barW, y, x + barW, y + h, r);
@@ -244,11 +263,12 @@ export default function App() {
     }
   }, [peaks, curTime, duration, t]);
 
-  // Static redraw on progress/theme/peaks change (no animation — intro stays at 1).
+  // Static redraw on progress/theme/peaks change, and whenever the window resizes
+  // (the canvas is sized in pixels, so it must be re-rendered at the new width).
   useEffect(() => {
     if (introRafRef.current) return; // skip while a wave-in animation is running
     drawWave(1);
-  }, [drawWave]);
+  }, [drawWave, winW]);
 
   // Trigger the left-to-right wave-in whenever a new track's peaks arrive.
   useEffect(() => {
@@ -277,7 +297,11 @@ export default function App() {
     const a = audioRef.current;
     if (!a) return;
     const gain = (trackId && gainCache.current[trackId]) || 1;
-    a.volume = Math.max(0, Math.min(1, sliderVol * gain));
+    // HTML audio `volume` is linear amplitude, but perceived loudness is roughly
+    // logarithmic — a raw linear slider dumps most of its change into the bottom
+    // end. Squaring the slider value makes the *perceived* change even.
+    const perceptual = Math.pow(Math.max(0, Math.min(1, sliderVol)), 2);
+    a.volume = Math.max(0, Math.min(1, perceptual * gain));
   };
 
   // Add files (used by the picker and by drag-in), de-duplicating by file path.
@@ -301,8 +325,12 @@ export default function App() {
     const files = Array.from(e.dataTransfer.files || []);
     const paths = files.map((f) => window.vf.pathForFile(f)).filter(Boolean);
     if (paths.length) {
+      // Dragging a track back into VibeFilter cancels its "used" mark.
+      const dropped = new Set(paths);
+      setTracks((prev) => prev.map((tr) =>
+        tr.used && dropped.has(tr.filePath) ? { ...tr, used: false, usedAt: null } : tr));
       const objs = await window.vf.processFiles(paths);
-      addTrackObjects(objs);
+      addTrackObjects(objs); // already-known paths are ignored by addTrackObjects
     }
   };
 
@@ -604,8 +632,10 @@ export default function App() {
     const pool = filtered;
     if (pool.length === 0) return;
     const idx = pool.findIndex((tr) => tr.id === selectedId);
-    const next = idx === -1 ? pool[0] : pool[(idx + 1) % pool.length];
-    selectTrack(next);
+    if (idx === -1) { selectTrack(pool[0]); return; }
+    const atEnd = idx === pool.length - 1;
+    if (atEnd && !loopEnabled) return; // stop at the end unless looping
+    selectTrack(pool[(idx + 1) % pool.length]);
   };
   // Keep the ref current so the <audio> "ended" handler always calls the
   // latest version (with up-to-date filtered list and selection).
@@ -688,6 +718,13 @@ export default function App() {
   const empty = tracks.length === 0;
   const tileMin = { small: 110, medium: 160, large: 230 }[tileSize];
 
+  // Responsive panel sizing: shrink the side panels as the window narrows so the
+  // track grid keeps as much room as possible.
+  const compact = winW < 1100;
+  const veryCompact = winW < 900;
+  const sidebarW = veryCompact ? 210 : compact ? 240 : 280;
+  const playerW = veryCompact ? 250 : compact ? 290 : 340;
+
   // Colours for pie slices: alternate the two accent colours plus a few neutrals
   // so adjacent slices stay distinguishable even with many artists.
   const SLICE_COLORS = [t.green, t.orange, "#a78bfa", "#34d399", "#facc15",
@@ -706,7 +743,7 @@ export default function App() {
       <GlobalStyles t={t} />
       <audio ref={audioRef} />
 
-      <aside style={s.sidebar}>
+      <aside style={{ ...s.sidebar, width: sidebarW, minWidth: sidebarW }}>
         <div style={s.logo}>
           <img src={accentIcon} alt="VibeFilter" style={{ width: 34, height: 34, borderRadius: 9 }} />
           <div>
@@ -717,7 +754,7 @@ export default function App() {
         <div style={s.section}>
           <div style={s.label}>Filter by vibe</div>
           <div style={{ display: "flex", flexWrap: "wrap", gap: 7 }}>
-            <span style={{ ...s.chip(favsOnly, "#facc15"), padding: "5px 9px" }}
+            <span className="vf-chip" style={{ ...s.chip(favsOnly, "#facc15"), padding: "5px 9px" }}
               title="Show only favourites"
               onClick={() => setFavsOnly((v) => !v)}>
               <Icon d={ICONS.star} size={14} fill={favsOnly ? "currentColor" : "none"} />
@@ -726,7 +763,7 @@ export default function App() {
               const included = activeFilters.includes(tg.id);
               const excluded = excludedFilters.includes(tg.id);
               return (
-                <span key={tg.id}
+                <span key={tg.id} className="vf-chip"
                   title={excluded
                     ? "Excluded — left click to include, right click to reset"
                     : included
@@ -752,21 +789,30 @@ export default function App() {
               <span style={{ fontSize: 12.5, color: t.textDim, alignSelf: "center" }}>No tags yet.</span>
             )}
           </div>
-          {(activeFilters.length > 0 || excludedFilters.length > 0 || favsOnly) && (
-            <div onClick={clearFilters}
-              style={{ marginTop: 10, fontSize: 12, color: t.green, cursor: "pointer", fontWeight: 600 }}>
-              Clear filters
-            </div>
-          )}
+          {(() => {
+            const anyFilter = activeFilters.length > 0 || excludedFilters.length > 0 || favsOnly || search;
+            return (
+              <button onClick={() => { clearFilters(); setSearch(""); }} disabled={!anyFilter}
+                style={{ marginTop: 10, width: "100%", display: "inline-flex", alignItems: "center",
+                  justifyContent: "center", gap: 7, padding: "7px 10px", borderRadius: 8,
+                  fontFamily: "inherit", fontSize: 12.5, fontWeight: 600,
+                  cursor: anyFilter ? "pointer" : "not-allowed",
+                  border: `1px solid ${anyFilter ? t.green : t.border}`,
+                  background: anyFilter ? t.accentBg : "transparent",
+                  color: anyFilter ? t.green : t.textDim }}>
+                <Icon d={ICONS.x} size={13} /> Clear filters
+              </button>
+            );
+          })()}
           <div style={{ marginTop: 12, display: "flex", alignItems: "center", gap: 7, flexWrap: "wrap" }}>
             <span onClick={() => setHideUsed((v) => !v)}
               title={hideUsed ? "Used tracks are hidden" : "Used tracks are shown"}
-              style={{ ...s.chip(hideUsed, t.green), padding: "5px 10px", gap: 6 }}>
+              className="vf-chip" style={{ ...s.chip(hideUsed, t.green), padding: "5px 10px", gap: 6 }}>
               <Icon d={ICONS.check} size={13} /> Hide used
             </span>
             {usedCount > 0 && (
               <span onClick={undoLastUse} title="Un-use the most recently used track"
-                style={{ ...s.chip(false, t.green), padding: "5px 10px", gap: 6 }}>
+                className="vf-chip" style={{ ...s.chip(false, t.green), padding: "5px 10px", gap: 6 }}>
                 <Icon d={ICONS.undo} size={13} /> Undo use
               </span>
             )}
@@ -1064,7 +1110,7 @@ export default function App() {
             )}
           </div>
 
-          <aside style={s.player} className="vf-scroll">
+          <aside style={{ ...s.player, width: playerW, minWidth: playerW }} className="vf-scroll">
             <div style={s.label}>Now previewing</div>
             {selected ? (
               <>
@@ -1123,7 +1169,18 @@ export default function App() {
                   <span>{fmtTime(duration)}</span>
                 </div>
 
-                <div style={{ display: "flex", justifyContent: "center", alignItems: "center", gap: 18, marginBottom: 18 }}>
+                <div style={{ display: "flex", justifyContent: "center", alignItems: "center", gap: 14, marginBottom: 18 }}>
+                  <button onClick={toggleLoop}
+                    title={loopEnabled ? "Looping filtered tracks" : "Stop at end of list"}
+                    style={{
+                      width: 42, height: 42, borderRadius: "50%", cursor: "pointer",
+                      background: loopEnabled ? t.accentBg : t.bgCard2,
+                      border: `1px solid ${loopEnabled ? t.green : t.border}`,
+                      color: loopEnabled ? t.green : t.textMuted,
+                      display: "grid", placeItems: "center",
+                    }}>
+                    <Icon d={ICONS.loop} size={17} />
+                  </button>
                   <button onClick={togglePlay}
                     style={{
                       width: 60, height: 60, borderRadius: "50%", border: "none", cursor: "pointer",
@@ -1168,7 +1225,7 @@ export default function App() {
                     const on = selected.tags.includes(tg.id);
                     return (
                       <span key={tg.id} onClick={() => toggleTrackTag(selected.id, tg.id)}
-                        style={s.chip(on, tg.color)}>{tg.label}</span>
+                        className="vf-chip" style={s.chip(on, tg.color)}>{tg.label}</span>
                     );
                   })}
                 </div>
@@ -1275,7 +1332,7 @@ export default function App() {
       ); })()}
 
       {addTagOpen && (
-        <div onClick={() => setAddTagOpen(false)}
+        <div onMouseDown={(e) => { if (e.target === e.currentTarget) setAddTagOpen(false); }}
           className="vf-overlay" style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)",
             display: "grid", placeItems: "center", zIndex: 70 }}>
           <div className="vf-card" onClick={(e) => e.stopPropagation()}
@@ -1316,7 +1373,7 @@ export default function App() {
       )}
 
       {renaming && (
-        <div onClick={() => setRenaming(null)}
+        <div onMouseDown={(e) => { if (e.target === e.currentTarget) setRenaming(null); }}
           className="vf-overlay" style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)",
             display: "grid", placeItems: "center", zIndex: 70 }}>
           <div className="vf-card" onClick={(e) => e.stopPropagation()}
@@ -1359,7 +1416,7 @@ export default function App() {
       )}
 
       {settingsOpen && (
-        <div onClick={() => setSettingsOpen(false)}
+        <div onMouseDown={(e) => { if (e.target === e.currentTarget) setSettingsOpen(false); }}
           className="vf-overlay" style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)",
             display: "grid", placeItems: "center", zIndex: 70 }}>
           <div className="vf-card" onClick={(e) => e.stopPropagation()}
@@ -1572,7 +1629,7 @@ export default function App() {
       )}
 
       {bankOpen && (
-        <div onClick={() => { setBankOpen(false); setBankTargetTrack(null); }}
+        <div onMouseDown={(e) => { if (e.target === e.currentTarget) { setBankOpen(false); setBankTargetTrack(null); } }}
           className="vf-overlay" style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)",
             display: "grid", placeItems: "center", zIndex: 50 }}>
           <div className="vf-card" onClick={(e) => e.stopPropagation()}

@@ -67,7 +67,7 @@ export const makeStyles = (t) => ({
     display: "flex", flexDirection: "column", padding: 10,
     background: active ? t.accentBg : t.bgCard, borderRadius: 14,
     border: `1px solid ${active ? t.green : t.border}`, cursor: "grab",
-    transition: "border-color 0.15s, transform 0.12s", boxShadow: t.shadow,
+    transition: "border-color 0.15s, transform 0.14s ease, box-shadow 0.15s ease", boxShadow: t.shadow,
     position: "relative",
   }),
   cover: {
