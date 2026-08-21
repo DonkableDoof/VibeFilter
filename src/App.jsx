@@ -5,6 +5,7 @@ import { fmtTime, parseName as parseNameBase } from "./helpers";
 import { makeStyles } from "./styles";
 import { GlobalStyles } from "./GlobalStyles.jsx";
 import { TooltipButton } from "./TooltipButton.jsx";
+import { Dropdown } from "./Dropdown.jsx";
 import { fetchLatestRelease, isNewer, REPO_URL } from "./updateCheck";
 
 /*
@@ -76,6 +77,8 @@ export default function App() {
   const [updateVersion, setUpdateVersion] = useState(null); // newer release tag, or null
   const [updateDismissed, setUpdateDismissed] = useState(false);
   const [creditsCopied, setCreditsCopied] = useState(false);
+  const [newItem, setNewItem] = useState(null); // { kind: "playlist"|"profile", name } | null
+  const [playlistPicker, setPlaylistPicker] = useState(null); // { trackIds: [] } | null
   const [winW, setWinW] = useState(typeof window !== "undefined" ? window.innerWidth : 1200);
   const [hoverSlice, setHoverSlice] = useState(null); // index of hovered pie slice, or null
   const dragTagIndex = useRef(null);                  // index of tag being dragged
@@ -95,6 +98,34 @@ export default function App() {
   const nameLast = !!settings.nameLast;
   const loopEnabled = settings.loop !== false; // default on
   const toggleLoop = () => setSettings((p) => ({ ...p, loop: !(p.loop !== false) }));
+
+  // ── Playlists ──
+  // "All" is a virtual playlist that always shows every track.
+  const ALL_PLAYLIST = { id: "all", name: "All tracks" };
+  const playlists = settings.playlists || [];
+  const activePlaylist = settings.activePlaylist || "all";
+  const setActivePlaylist = (id) => setSettings((p) => ({ ...p, activePlaylist: id }));
+  const inPlaylist = (tr, plId) =>
+    plId === "all" || (Array.isArray(tr.playlists) && tr.playlists.includes(plId));
+
+  // ── Video profiles ──
+  // "Used" is tracked per video project, so the same track can be used in one
+  // video and still available in another.
+  const profiles = settings.profiles && settings.profiles.length
+    ? settings.profiles
+    : [{ id: "default", name: "Default project" }];
+  const activeProfile = settings.activeProfile || profiles[0].id;
+  const setActiveProfile = (id) => setSettings((p) => ({ ...p, activeProfile: id }));
+  const isUsed = (tr) => !!(tr.usedBy && tr.usedBy[activeProfile]);
+  const usedAtFor = (tr) => (tr.usedBy && tr.usedBy[activeProfile]) || 0;
+  // Set/clear a track's used mark for the active profile.
+  const markUsed = (tr, used) => {
+    const usedBy = { ...(tr.usedBy || {}) };
+    if (used) usedBy[activeProfile] = Date.now();
+    else delete usedBy[activeProfile];
+    return { ...tr, usedBy };
+  };
+
   // Local wrapper so every parseName call in this file respects the name-format setting.
   const parseName = (tr) => parseNameBase(tr, nameLast);
   const t = useMemo(() => buildTheme(isLight, accentName), [isLight, accentName]);
@@ -106,9 +137,19 @@ export default function App() {
     (async () => {
       const lib = await window.vf.loadLibrary();
       if (lib.tracks) {
-        // Migrate any legacy `favorite` key to `favourite`.
-        setTracks(lib.tracks.map((tr) =>
-          "favorite" in tr ? { ...tr, favourite: tr.favourite ?? tr.favorite, favorite: undefined } : tr));
+        setTracks(lib.tracks.map((tr) => {
+          let out = tr;
+          // Legacy `favorite` key → `favourite`.
+          if ("favorite" in out) {
+            out = { ...out, favourite: out.favourite ?? out.favorite, favorite: undefined };
+          }
+          // Legacy single `used` flag → per-profile usedBy map (default project).
+          if (!out.usedBy) {
+            out = { ...out, usedBy: out.used ? { default: out.usedAt || Date.now() } : {} };
+          }
+          if (!Array.isArray(out.playlists)) out = { ...out, playlists: [] };
+          return out;
+        }));
       }
       if (lib.tags) setTags(lib.tags);
       if (lib.settings) {
@@ -305,11 +346,15 @@ export default function App() {
   };
 
   // Add files (used by the picker and by drag-in), de-duplicating by file path.
+  // Imports always land in the library ("All tracks") regardless of which playlist
+  // is open — use the right-click menu or bulk select to file them into playlists.
   const addTrackObjects = useCallback((objs) => {
     if (!objs || !objs.length) return;
     setTracks((prev) => {
       const existingPaths = new Set(prev.map((p) => p.filePath));
-      const fresh = objs.filter((o) => !existingPaths.has(o.filePath));
+      const fresh = objs
+        .filter((o) => !existingPaths.has(o.filePath))
+        .map((o) => ({ ...o, usedBy: {}, playlists: [] }));
       return [...prev, ...fresh];
     });
   }, []);
@@ -328,7 +373,7 @@ export default function App() {
       // Dragging a track back into VibeFilter cancels its "used" mark.
       const dropped = new Set(paths);
       setTracks((prev) => prev.map((tr) =>
-        tr.used && dropped.has(tr.filePath) ? { ...tr, used: false, usedAt: null } : tr));
+        isUsed(tr) && dropped.has(tr.filePath) ? markUsed(tr, false) : tr));
       const objs = await window.vf.processFiles(paths);
       addTrackObjects(objs); // already-known paths are ignored by addTrackObjects
     }
@@ -558,8 +603,9 @@ export default function App() {
       const matchTags = activeFilters.every((f) => tr.tags.includes(f));
       const matchExcluded = excludedFilters.every((f) => !tr.tags.includes(f));
       const matchFavs = !favsOnly || tr.favourite;
-      const matchUsed = !hideUsed || !tr.used;
-      return matchSearch && matchTags && matchExcluded && matchFavs && matchUsed;
+      const matchUsed = !hideUsed || !isUsed(tr);
+      const matchPlaylist = inPlaylist(tr, activePlaylist);
+      return matchSearch && matchTags && matchExcluded && matchFavs && matchUsed && matchPlaylist;
     })
     .sort((a, b) => {
       const pa = parseName(a), pb = parseName(b);
@@ -574,13 +620,13 @@ export default function App() {
 
   // Total duration of the whole library, rounded to whole minutes.
   const totalMinutes = Math.round(tracks.reduce((sum, tr) => sum + (tr.durationSec || 0), 0) / 60);
-  const usedCount = tracks.filter((tr) => tr.used).length;
+  const usedCount = tracks.filter((tr) => isUsed(tr)).length;
 
   // "Title — Artist" lines for every used track, sorted by artist then title.
   // Handy for pasting into a YouTube description.
   const creditsText = () =>
     tracks
-      .filter((tr) => tr.used)
+      .filter((tr) => isUsed(tr))
       .map((tr) => parseName(tr))
       .sort((a, b) => {
         const byArtist = (a.artist || "").localeCompare(b.artist || "", undefined, { sensitivity: "base" });
@@ -695,22 +741,94 @@ export default function App() {
     e.preventDefault();
     window.vf.startDrag(tr.filePath);
     // usedAt lets "Undo use" find the most recently used track, even after a restart.
-    setTracks((prev) => prev.map((x) => (x.id === tr.id ? { ...x, used: true, usedAt: Date.now() } : x)));
+    setTracks((prev) => prev.map((x) => (x.id === tr.id ? markUsed(x, true) : x)));
   };
+  // Clear every used mark for the active video profile only.
   const resetUsed = () => {
-    setTracks((prev) => prev.map((tr) => (tr.used ? { ...tr, used: false, usedAt: null } : tr)));
+    setTracks((prev) => prev.map((tr) => (isUsed(tr) ? markUsed(tr, false) : tr)));
   };
-  // Mark a single track used / unused (from the right-click menu).
+  // Mark a single track used / unused for the active profile.
   const setTrackUsed = (id, used) => {
-    setTracks((prev) => prev.map((tr) =>
-      tr.id === id ? { ...tr, used, usedAt: used ? Date.now() : null } : tr));
+    setTracks((prev) => prev.map((tr) => (tr.id === id ? markUsed(tr, used) : tr)));
   };
-  // Un-use whichever track was used most recently.
+  // Un-use whichever track was used most recently in this profile.
   const undoLastUse = () => {
-    const used = tracks.filter((tr) => tr.used);
+    const used = tracks.filter((tr) => isUsed(tr));
     if (used.length === 0) return;
-    const latest = used.reduce((a, b) => ((b.usedAt || 0) > (a.usedAt || 0) ? b : a));
+    const latest = used.reduce((a, b) => (usedAtFor(b) > usedAtFor(a) ? b : a));
     setTrackUsed(latest.id, false);
+  };
+
+  // Create a playlist or video profile from the "New…" dialog, then switch to it.
+  const createNewItem = () => {
+    if (!newItem) return;
+    const name = newItem.name.trim();
+    if (!name) return;
+    const id = `${newItem.kind}-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`;
+    if (newItem.kind === "playlist") {
+      const assignTo = newItem.assignTo || null;
+      setSettings((p) => ({
+        ...p,
+        playlists: [...(p.playlists || []), { id, name }],
+        // Only jump to the new playlist when it wasn't created to file tracks into.
+        activePlaylist: assignTo ? p.activePlaylist || "all" : id,
+      }));
+      if (assignTo) setPlaylistMembership(assignTo, id, true);
+    } else {
+      setSettings((p) => ({
+        ...p,
+        profiles: [...(p.profiles && p.profiles.length ? p.profiles : [{ id: "default", name: "Default project" }]), { id, name }],
+        activeProfile: id,
+      }));
+    }
+    setNewItem(null);
+  };
+
+  // Remove the active playlist (tracks stay in the library) or profile.
+  const deleteActivePlaylist = () => {
+    if (activePlaylist === "all") return;
+    setTracks((prev) => prev.map((tr) =>
+      (tr.playlists || []).includes(activePlaylist)
+        ? { ...tr, playlists: tr.playlists.filter((x) => x !== activePlaylist) }
+        : tr));
+    setSettings((p) => ({
+      ...p,
+      playlists: (p.playlists || []).filter((pl) => pl.id !== activePlaylist),
+      activePlaylist: "all",
+    }));
+  };
+  const deleteActiveProfile = () => {
+    if (profiles.length <= 1) return;
+    setTracks((prev) => prev.map((tr) => {
+      if (!tr.usedBy || !(activeProfile in tr.usedBy)) return tr;
+      const usedBy = { ...tr.usedBy };
+      delete usedBy[activeProfile];
+      return { ...tr, usedBy };
+    }));
+    const remaining = profiles.filter((pf) => pf.id !== activeProfile);
+    setSettings((p) => ({ ...p, profiles: remaining, activeProfile: remaining[0].id }));
+  };
+
+  // Playlist membership for any set of tracks (one track, or a bulk selection).
+  const setPlaylistMembership = (trackIds, plId, member) => {
+    const ids = new Set(trackIds);
+    setTracks((prev) => prev.map((tr) => {
+      if (!ids.has(tr.id)) return tr;
+      const cur = tr.playlists || [];
+      if (member && !cur.includes(plId)) return { ...tr, playlists: [...cur, plId] };
+      if (!member && cur.includes(plId)) return { ...tr, playlists: cur.filter((x) => x !== plId) };
+      return tr;
+    }));
+  };
+  // True when every given track is already in the playlist.
+  const allInPlaylist = (trackIds, plId) =>
+    trackIds.length > 0 && trackIds.every((id) => {
+      const tr = tracks.find((x) => x.id === id);
+      return tr && (tr.playlists || []).includes(plId);
+    });
+  const removeFromPlaylist = (id) => {
+    if (activePlaylist === "all") return;
+    setPlaylistMembership([id], activePlaylist, false);
   };
 
   // ── 7. Render ─────────────────────────────────────────────────────────────
@@ -826,6 +944,23 @@ export default function App() {
         </div>
 
         <div style={s.section}>
+          <div style={s.label}>Video project</div>
+          <Dropdown t={t} icon={ICONS.film} width="100%"
+            value={activeProfile}
+            options={profiles.map((pf) => ({
+              ...pf,
+              count: tracks.filter((tr) => tr.usedBy && tr.usedBy[pf.id]).length,
+            }))}
+            onSelect={setActiveProfile}
+            onAddNew={() => setNewItem({ kind: "profile", name: "" })}
+            addNewLabel="New project" />
+          <div style={{ marginTop: 8, fontSize: 11.5, color: t.textDim, lineHeight: 1.5 }}>
+            Used tracks are tracked per project, so a track used in one video stays
+            available in another.
+          </div>
+        </div>
+
+        <div style={s.section}>
           <div style={s.label}>Manage tags</div>
           <button onClick={openAddTag}
             style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 7,
@@ -917,6 +1052,19 @@ export default function App() {
           </div>
         )}
         <div style={s.topbar}>
+          <Dropdown t={t} icon={ICONS.playlist}
+            width={compact ? 140 : 180}
+            value={activePlaylist}
+            options={[
+              { ...ALL_PLAYLIST, count: tracks.length },
+              ...playlists.map((pl) => ({
+                ...pl,
+                count: tracks.filter((tr) => inPlaylist(tr, pl.id)).length,
+              })),
+            ]}
+            onSelect={setActivePlaylist}
+            onAddNew={() => setNewItem({ kind: "playlist", name: "" })}
+            addNewLabel="New playlist" />
           <div style={s.searchWrap}>
             <Icon d={ICONS.search} size={16} />
             <input style={s.searchInput} placeholder="Search tracks…"
@@ -963,6 +1111,15 @@ export default function App() {
                 color: selectedTracks.size ? "#1a1a1a" : t.textDim }}>
               <Icon d={ICONS.star} size={15} fill="currentColor" /> {selectedAllFav ? "Unfavourite selected" : "Favourite selected"}
             </button>
+            <button onClick={() => setPlaylistPicker({ trackIds: [...selectedTracks] })}
+              disabled={selectedTracks.size === 0}
+              style={{ display: "inline-flex", alignItems: "center", gap: 7, padding: "7px 14px",
+                borderRadius: 8, fontFamily: "inherit", fontSize: 13, fontWeight: 600,
+                cursor: selectedTracks.size ? "pointer" : "not-allowed", background: "transparent",
+                border: `1px solid ${selectedTracks.size ? t.green : t.border}`,
+                color: selectedTracks.size ? t.green : t.textDim }}>
+                <Icon d={ICONS.playlist} size={15} /> Add to playlist
+              </button>
             <button onClick={() => setBankOpen(true)} disabled={selectedTracks.size === 0}
               style={{ display: "inline-flex", alignItems: "center", gap: 7, padding: "7px 14px",
                 borderRadius: 8, border: "none", fontFamily: "inherit", fontSize: 13, fontWeight: 600,
@@ -1039,7 +1196,7 @@ export default function App() {
                               : {}),
                             cursor: selectMode ? "pointer" : "grab",
                             outline: "none",
-                            opacity: tr.used && !active ? 0.45 : 1,
+                            opacity: isUsed(tr) && !active ? 0.45 : 1,
                           }}
                           draggable={!selectMode}
                           onDragStart={(e) => onTrackDragStart(e, tr)}
@@ -1069,7 +1226,7 @@ export default function App() {
                                 <Icon d={ICONS.star} size={14} fill="currentColor" />
                               </div>
                             )}
-                            {!selectMode && tr.used && (
+                            {!selectMode && isUsed(tr) && (
                               <div title="Used"
                                 style={{
                                   position: "absolute", top: 8, left: 8, width: 24, height: 24,
@@ -1282,7 +1439,7 @@ export default function App() {
             style={{ position: "fixed", inset: 0, zIndex: 60 }} />
           <div style={{
             position: "fixed", left: Math.min(ctxMenu.x, window.innerWidth - 200),
-            top: Math.min(ctxMenu.y, window.innerHeight - 230), zIndex: 61,
+            top: Math.min(ctxMenu.y, window.innerHeight - 300), zIndex: 61,
             background: t.bgCard, border: `1px solid ${t.border}`, borderRadius: 10,
             boxShadow: "0 10px 30px rgba(0,0,0,0.35)", padding: 5, minWidth: 180 }}>
             <button
@@ -1294,12 +1451,12 @@ export default function App() {
               {ctxTrack && ctxTrack.favourite ? "Unfavourite" : "Favourite"}
             </button>
             <button
-              onClick={() => { setTrackUsed(ctxMenu.trackId, !(ctxTrack && ctxTrack.used)); setCtxMenu(null); }}
+              onClick={() => { setTrackUsed(ctxMenu.trackId, !(ctxTrack && isUsed(ctxTrack))); setCtxMenu(null); }}
               onMouseEnter={(e) => (e.currentTarget.style.background = t.bgHover)}
               onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
-              style={{ ...itemBase, color: ctxTrack && ctxTrack.used ? t.green : t.text }}>
-              <Icon d={ctxTrack && ctxTrack.used ? ICONS.undo : ICONS.check} size={15} />
-              {ctxTrack && ctxTrack.used ? "Mark as unused" : "Mark as used"}
+              style={{ ...itemBase, color: ctxTrack && isUsed(ctxTrack) ? t.green : t.text }}>
+              <Icon d={ctxTrack && isUsed(ctxTrack) ? ICONS.undo : ICONS.check} size={15} />
+              {ctxTrack && isUsed(ctxTrack) ? "Mark as unused" : "Mark as used"}
             </button>
             <button
               onClick={() => {
@@ -1319,6 +1476,22 @@ export default function App() {
               style={{ ...itemBase, color: t.text }}>
               <Icon d={ICONS.reveal} size={15} /> Reveal in file explorer
             </button>
+            <button
+              onClick={() => { setPlaylistPicker({ trackIds: [ctxMenu.trackId] }); setCtxMenu(null); }}
+              onMouseEnter={(e) => (e.currentTarget.style.background = t.bgHover)}
+              onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+              style={{ ...itemBase, color: t.text }}>
+              <Icon d={ICONS.playlist} size={15} /> Add to playlist…
+            </button>
+            {activePlaylist !== "all" && (
+              <button
+                onClick={() => { removeFromPlaylist(ctxMenu.trackId); setCtxMenu(null); }}
+                onMouseEnter={(e) => (e.currentTarget.style.background = t.bgHover)}
+                onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+                style={{ ...itemBase, color: t.text }}>
+                <Icon d={ICONS.x} size={15} /> Remove from this playlist
+              </button>
+            )}
             <div style={{ height: 1, background: t.border, margin: "4px 6px" }} />
             <button
               onClick={() => { removeTrack(ctxMenu.trackId); setCtxMenu(null); }}
@@ -1330,6 +1503,119 @@ export default function App() {
           </div>
         </>
       ); })()}
+
+      {playlistPicker && (() => {
+        const ids = playlistPicker.trackIds;
+        return (
+        <div onMouseDown={(e) => { if (e.target === e.currentTarget) setPlaylistPicker(null); }}
+          className="vf-overlay" style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)",
+            display: "grid", placeItems: "center", zIndex: 72 }}>
+          <div className="vf-card" onClick={(e) => e.stopPropagation()}
+            style={{ width: 380, maxWidth: "90vw", maxHeight: "70vh", background: t.bgCard,
+              borderRadius: 14, border: `1px solid ${t.border}`, padding: 22,
+              display: "flex", flexDirection: "column", boxShadow: "0 20px 60px rgba(0,0,0,0.4)" }}>
+            <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 4 }}>Add to playlist</div>
+            <div style={{ fontSize: 12.5, color: t.textDim, marginBottom: 16 }}>
+              {ids.length === 1 ? "Tick the playlists this track belongs to."
+                : `Tick a playlist to add all ${ids.length} selected tracks.`}
+            </div>
+
+            <div className="vf-scroll" style={{ overflow: "auto", minHeight: 0, flex: 1,
+              display: "flex", flexDirection: "column", gap: 5, marginBottom: 16 }}>
+              {playlists.length === 0 && (
+                <div style={{ fontSize: 13, color: t.textDim, padding: "10px 0" }}>
+                  No playlists yet — create one below.
+                </div>
+              )}
+              {playlists.map((pl) => {
+                const on = allInPlaylist(ids, pl.id);
+                return (
+                  <button key={pl.id}
+                    onClick={() => setPlaylistMembership(ids, pl.id, !on)}
+                    onMouseEnter={(e) => (e.currentTarget.style.background = t.bgHover)}
+                    onMouseLeave={(e) => (e.currentTarget.style.background = on ? t.accentBg : "transparent")}
+                    style={{ display: "flex", alignItems: "center", gap: 10, width: "100%",
+                      padding: "9px 11px", borderRadius: 9, cursor: "pointer",
+                      fontSize: 13, fontWeight: 600, fontFamily: "inherit", textAlign: "left",
+                      background: on ? t.accentBg : "transparent",
+                      border: `1px solid ${on ? t.green : t.border}`,
+                      color: on ? t.green : t.text }}>
+                    <span style={{ width: 18, height: 18, borderRadius: 5, flexShrink: 0,
+                      display: "grid", placeItems: "center",
+                      background: on ? t.green : "transparent",
+                      border: `1px solid ${on ? t.green : t.border}`, color: "#fff" }}>
+                      {on && <Icon d={ICONS.check} size={12} />}
+                    </span>
+                    <span style={{ flex: 1, whiteSpace: "nowrap", overflow: "hidden",
+                      textOverflow: "ellipsis" }}>{pl.name}</span>
+                    <span style={{ fontSize: 12, color: t.textDim }}>
+                      {tracks.filter((tr) => (tr.playlists || []).includes(pl.id)).length}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+              <button onClick={() => setNewItem({ kind: "playlist", name: "", assignTo: ids })}
+                style={{ display: "inline-flex", alignItems: "center", gap: 7, padding: "8px 14px",
+                  borderRadius: 8, border: `1px solid ${t.border}`, background: t.bgCard2,
+                  color: t.green, cursor: "pointer", fontSize: 13, fontWeight: 600, fontFamily: "inherit" }}>
+                <Icon d={ICONS.plus} size={14} /> New playlist
+              </button>
+              <button onClick={() => setPlaylistPicker(null)}
+                style={{ padding: "8px 16px", borderRadius: 8, border: "none",
+                  background: t.green, color: "#fff", cursor: "pointer", fontSize: 13,
+                  fontWeight: 600, fontFamily: "inherit" }}>
+                Done
+              </button>
+            </div>
+          </div>
+        </div>
+        );
+      })()}
+
+      {newItem && (
+        <div onMouseDown={(e) => { if (e.target === e.currentTarget) setNewItem(null); }}
+          className="vf-overlay" style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)",
+            display: "grid", placeItems: "center", zIndex: 70 }}>
+          <div className="vf-card" onClick={(e) => e.stopPropagation()}
+            style={{ width: 360, maxWidth: "90vw", background: t.bgCard, borderRadius: 14,
+              border: `1px solid ${t.border}`, padding: 22, boxShadow: "0 20px 60px rgba(0,0,0,0.4)" }}>
+            <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 4 }}>
+              {newItem.kind === "playlist" ? "New playlist" : "New video project"}
+            </div>
+            <div style={{ fontSize: 12.5, color: t.textDim, marginBottom: 16 }}>
+              {newItem.kind === "playlist"
+                ? "Tracks you import while this playlist is open will be added to it."
+                : "Used tracks are remembered separately for each video project."}
+            </div>
+            <input autoFocus value={newItem.name}
+              onChange={(e) => setNewItem((n) => ({ ...n, name: e.target.value }))}
+              onKeyDown={(e) => { if (e.key === "Enter") createNewItem(); if (e.key === "Escape") setNewItem(null); }}
+              placeholder={newItem.kind === "playlist" ? "Playlist name…" : "Project name…"}
+              style={{ width: "100%", boxSizing: "border-box", padding: "9px 11px", marginBottom: 20,
+                background: t.bgCard2, border: `1px solid ${t.border}`, borderRadius: 8,
+                color: t.text, fontSize: 14, fontFamily: "inherit", outline: "none" }} />
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+              <button onClick={() => setNewItem(null)}
+                style={{ padding: "8px 16px", borderRadius: 8, border: `1px solid ${t.border}`,
+                  background: t.bgCard2, color: t.textMuted, cursor: "pointer", fontSize: 13,
+                  fontWeight: 600, fontFamily: "inherit" }}>
+                Cancel
+              </button>
+              <button onClick={createNewItem} disabled={!newItem.name.trim()}
+                style={{ padding: "8px 16px", borderRadius: 8, border: "none",
+                  background: newItem.name.trim() ? t.green : t.bgCard2,
+                  color: newItem.name.trim() ? "#fff" : t.textDim,
+                  cursor: newItem.name.trim() ? "pointer" : "not-allowed", fontSize: 13,
+                  fontWeight: 600, fontFamily: "inherit" }}>
+                Create
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {addTagOpen && (
         <div onMouseDown={(e) => { if (e.target === e.currentTarget) setAddTagOpen(false); }}
@@ -1520,6 +1806,26 @@ export default function App() {
               </div>
 
               {/* Credits for used tracks */}
+              <div style={s.label}>Playlists &amp; projects</div>
+              <div style={{ display: "flex", gap: 8, marginBottom: 22, flexWrap: "wrap" }}>
+                <button onClick={deleteActivePlaylist} disabled={activePlaylist === "all"}
+                  style={{ display: "inline-flex", alignItems: "center", gap: 7, padding: "8px 13px",
+                    borderRadius: 9, fontFamily: "inherit", fontSize: 12.5, fontWeight: 600,
+                    cursor: activePlaylist === "all" ? "not-allowed" : "pointer", background: "transparent",
+                    border: `1px solid ${activePlaylist === "all" ? t.border : t.red}`,
+                    color: activePlaylist === "all" ? t.textDim : t.red }}>
+                  <Icon d={ICONS.trash} size={14} /> Delete current playlist
+                </button>
+                <button onClick={deleteActiveProfile} disabled={profiles.length <= 1}
+                  style={{ display: "inline-flex", alignItems: "center", gap: 7, padding: "8px 13px",
+                    borderRadius: 9, fontFamily: "inherit", fontSize: 12.5, fontWeight: 600,
+                    cursor: profiles.length <= 1 ? "not-allowed" : "pointer", background: "transparent",
+                    border: `1px solid ${profiles.length <= 1 ? t.border : t.red}`,
+                    color: profiles.length <= 1 ? t.textDim : t.red }}>
+                  <Icon d={ICONS.trash} size={14} /> Delete current project
+                </button>
+              </div>
+
               <div style={s.label}>Credits</div>
               <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 20 }}>
                 <button onClick={copyCredits} disabled={usedCount === 0}
@@ -1533,8 +1839,8 @@ export default function App() {
                 </button>
                 <span style={{ fontSize: 12.5, color: t.textDim }}>
                   {usedCount > 0
-                    ? `${usedCount} used track${usedCount !== 1 ? "s" : ""}`
-                    : "No used tracks yet"}
+                    ? `${usedCount} used in "${(profiles.find((p) => p.id === activeProfile) || {}).name}"`
+                    : "No used tracks in this project"}
                 </span>
               </div>
 

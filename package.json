@@ -1,6 +1,7 @@
 {
   "name": "vibefilter",
-  "version": "1.4.0",
+  "version": "1.5.0",
+  "type": "module",
   "description": "",
   "author": "DuckableDev",
   "main": "electron/main.js",
