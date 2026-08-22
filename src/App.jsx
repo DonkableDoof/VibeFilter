@@ -79,6 +79,8 @@ export default function App() {
   const [creditsCopied, setCreditsCopied] = useState(false);
   const [newItem, setNewItem] = useState(null); // { kind: "playlist"|"profile", name } | null
   const [playlistPicker, setPlaylistPicker] = useState(null); // { trackIds: [] } | null
+  const [renameItem, setRenameItem] = useState(null); // { kind, id, name } | null
+  const [projectPrompt, setProjectPrompt] = useState(false); // startup project chooser
   const [winW, setWinW] = useState(typeof window !== "undefined" ? window.innerWidth : 1200);
   const [hoverSlice, setHoverSlice] = useState(null); // index of hovered pie slice, or null
   const dragTagIndex = useRef(null);                  // index of tag being dragged
@@ -86,13 +88,15 @@ export default function App() {
 
   const isLight = settings.lightMode;
   const accentName = settings.accent || "Blue / Pink";
-  const accentIcon = {
+  // The ?v= suffix busts the cache whenever the app version changes, so updated
+  // icon artwork actually shows instead of a stale cached copy.
+  const accentIcon = ({
     "Blue / Pink": "./icon-blue-pink.png",
     "Green / Lime": "./icon-green-lime.png",
     "Purple / Pink": "./icon-purple-pink.png",
     "Orange / Red": "./icon-orange-red.png",
     "Teal / Cyan": "./icon-teal-cyan.png",
-  }[accentName] || "./app-icon.png";
+  }[accentName] || "./app-icon.png") + `?v=${__APP_VERSION__}`;
   const tileSize = settings.tileSize || "medium";
   const setTileSize = (size) => setSettings((p) => ({ ...p, tileSize: size }));
   const nameLast = !!settings.nameLast;
@@ -115,6 +119,7 @@ export default function App() {
     ? settings.profiles
     : [{ id: "default", name: "Default project" }];
   const activeProfile = settings.activeProfile || profiles[0].id;
+  const askProjectOnOpen = settings.askProjectOnOpen !== false; // default on
   const setActiveProfile = (id) => setSettings((p) => ({ ...p, activeProfile: id }));
   const isUsed = (tr) => !!(tr.usedBy && tr.usedBy[activeProfile]);
   const usedAtFor = (tr) => (tr.usedBy && tr.usedBy[activeProfile]) || 0;
@@ -157,6 +162,8 @@ export default function App() {
         if (typeof lib.settings.volume === "number") setVolume(lib.settings.volume);
       }
       setLoaded(true);
+      // Remind the user which video project they're filing used tracks under.
+      if (!lib.settings || lib.settings.askProjectOnOpen !== false) setProjectPrompt(true);
     })();
     (async () => {
       const b = await window.vf.bankList();
@@ -622,11 +629,11 @@ export default function App() {
   const totalMinutes = Math.round(tracks.reduce((sum, tr) => sum + (tr.durationSec || 0), 0) / 60);
   const usedCount = tracks.filter((tr) => isUsed(tr)).length;
 
-  // "Title — Artist" lines for every used track, sorted by artist then title.
-  // Handy for pasting into a YouTube description.
+  // "Artist — Title" lines for every used track, sorted by artist then title.
+  // Tracks flagged noCredit (via right-click) are left out.
   const creditsText = () =>
     tracks
-      .filter((tr) => isUsed(tr))
+      .filter((tr) => isUsed(tr) && !tr.noCredit)
       .map((tr) => parseName(tr))
       .sort((a, b) => {
         const byArtist = (a.artist || "").localeCompare(b.artist || "", undefined, { sensitivity: "base" });
@@ -634,6 +641,10 @@ export default function App() {
       })
       .map(({ title, artist }) => (artist ? `${artist} — ${title}` : title))
       .join("\n");
+  const creditCount = tracks.filter((tr) => isUsed(tr) && !tr.noCredit).length;
+  const toggleNoCredit = (id) => {
+    setTracks((prev) => prev.map((tr) => (tr.id === id ? { ...tr, noCredit: !tr.noCredit } : tr)));
+  };
 
   const copyCredits = async () => {
     const text = creditsText();
@@ -785,29 +796,43 @@ export default function App() {
   };
 
   // Remove the active playlist (tracks stay in the library) or profile.
-  const deleteActivePlaylist = () => {
-    if (activePlaylist === "all") return;
+  // Remove a playlist by id (tracks stay in the library).
+  const deletePlaylist = (plId) => {
     setTracks((prev) => prev.map((tr) =>
-      (tr.playlists || []).includes(activePlaylist)
-        ? { ...tr, playlists: tr.playlists.filter((x) => x !== activePlaylist) }
+      (tr.playlists || []).includes(plId)
+        ? { ...tr, playlists: tr.playlists.filter((x) => x !== plId) }
         : tr));
     setSettings((p) => ({
       ...p,
-      playlists: (p.playlists || []).filter((pl) => pl.id !== activePlaylist),
-      activePlaylist: "all",
+      playlists: (p.playlists || []).filter((pl) => pl.id !== plId),
+      activePlaylist: p.activePlaylist === plId ? "all" : p.activePlaylist,
     }));
   };
-  const deleteActiveProfile = () => {
+  // Remove a video project by id, clearing only that project's used marks.
+  const deleteProfile = (pfId) => {
     if (profiles.length <= 1) return;
     setTracks((prev) => prev.map((tr) => {
-      if (!tr.usedBy || !(activeProfile in tr.usedBy)) return tr;
+      if (!tr.usedBy || !(pfId in tr.usedBy)) return tr;
       const usedBy = { ...tr.usedBy };
-      delete usedBy[activeProfile];
+      delete usedBy[pfId];
       return { ...tr, usedBy };
     }));
-    const remaining = profiles.filter((pf) => pf.id !== activeProfile);
-    setSettings((p) => ({ ...p, profiles: remaining, activeProfile: remaining[0].id }));
+    const remaining = profiles.filter((pf) => pf.id !== pfId);
+    setSettings((p) => ({
+      ...p,
+      profiles: remaining,
+      activeProfile: p.activeProfile === pfId ? remaining[0].id : p.activeProfile,
+    }));
   };
+  // Rename a playlist or project in place.
+  const renamePlaylist = (plId, name) => setSettings((p) => ({
+    ...p, playlists: (p.playlists || []).map((pl) => (pl.id === plId ? { ...pl, name } : pl)),
+  }));
+  const renameProfile = (pfId, name) => setSettings((p) => ({
+    ...p,
+    profiles: (p.profiles && p.profiles.length ? p.profiles : profiles)
+      .map((pf) => (pf.id === pfId ? { ...pf, name } : pf)),
+  }));
 
   // Playlist membership for any set of tracks (one track, or a bulk selection).
   const setPlaylistMembership = (trackIds, plId, member) => {
@@ -861,12 +886,25 @@ export default function App() {
       <GlobalStyles t={t} />
       <audio ref={audioRef} />
 
-      <aside style={{ ...s.sidebar, width: sidebarW, minWidth: sidebarW }}>
+      <aside className="vf-scroll" style={{ ...s.sidebar, width: sidebarW, minWidth: sidebarW }}>
         <div style={s.logo}>
           <img src={accentIcon} alt="VibeFilter" style={{ width: 34, height: 34, borderRadius: 9 }} />
           <div>
             <div style={{ fontSize: 16, fontWeight: 700, letterSpacing: -0.3 }}>VibeFilter</div>
           </div>
+        </div>
+
+        <div style={s.section}>
+          <div style={s.label}>Video project</div>
+          <Dropdown t={t} icon={ICONS.film} width="100%"
+            value={activeProfile}
+            options={profiles.map((pf) => ({
+              ...pf,
+              count: tracks.filter((tr) => tr.usedBy && tr.usedBy[pf.id]).length,
+            }))}
+            onSelect={setActiveProfile}
+            onAddNew={() => setNewItem({ kind: "profile", name: "" })}
+            addNewLabel="New project" />
         </div>
 
         <div style={s.section}>
@@ -940,23 +978,6 @@ export default function App() {
                 Reset used ({usedCount})
               </span>
             )}
-          </div>
-        </div>
-
-        <div style={s.section}>
-          <div style={s.label}>Video project</div>
-          <Dropdown t={t} icon={ICONS.film} width="100%"
-            value={activeProfile}
-            options={profiles.map((pf) => ({
-              ...pf,
-              count: tracks.filter((tr) => tr.usedBy && tr.usedBy[pf.id]).length,
-            }))}
-            onSelect={setActiveProfile}
-            onAddNew={() => setNewItem({ kind: "profile", name: "" })}
-            addNewLabel="New project" />
-          <div style={{ marginTop: 8, fontSize: 11.5, color: t.textDim, lineHeight: 1.5 }}>
-            Used tracks are tracked per project, so a track used in one video stays
-            available in another.
           </div>
         </div>
 
@@ -1477,6 +1498,14 @@ export default function App() {
               <Icon d={ICONS.reveal} size={15} /> Reveal in file explorer
             </button>
             <button
+              onClick={() => { toggleNoCredit(ctxMenu.trackId); setCtxMenu(null); }}
+              onMouseEnter={(e) => (e.currentTarget.style.background = t.bgHover)}
+              onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+              style={{ ...itemBase, color: ctxTrack && ctxTrack.noCredit ? t.textDim : t.text }}>
+              <Icon d={ICONS.clipboard} size={15} />
+              {ctxTrack && ctxTrack.noCredit ? "Include in credits" : "Exclude from credits"}
+            </button>
+            <button
               onClick={() => { setPlaylistPicker({ trackIds: [ctxMenu.trackId] }); setCtxMenu(null); }}
               onMouseEnter={(e) => (e.currentTarget.style.background = t.bgHover)}
               onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
@@ -1503,6 +1532,105 @@ export default function App() {
           </div>
         </>
       ); })()}
+
+      {projectPrompt && (
+        <div className="vf-overlay" style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)",
+          display: "grid", placeItems: "center", zIndex: 90 }}>
+          <div className="vf-card"
+            style={{ width: 400, maxWidth: "92vw", maxHeight: "72vh", background: t.bgCard,
+              borderRadius: 16, border: `1px solid ${t.border}`, padding: 24,
+              display: "flex", flexDirection: "column", boxShadow: "0 20px 60px rgba(0,0,0,0.45)" }}>
+            <div style={{ fontSize: 17, fontWeight: 700, marginBottom: 4 }}>Which video are you working on?</div>
+            <div style={{ fontSize: 12.5, color: t.textDim, marginBottom: 18 }}>
+              Pick a project to continue — tracks you drag out will be marked as used in it.
+            </div>
+            <div className="vf-scroll" style={{ overflow: "auto", minHeight: 0, flex: 1,
+              display: "flex", flexDirection: "column", gap: 6, marginBottom: 18 }}>
+              {profiles.map((pf) => {
+                const on = pf.id === activeProfile;
+                return (
+                  <button key={pf.id}
+                    onClick={() => { setActiveProfile(pf.id); setProjectPrompt(false); }}
+                    style={{ display: "flex", alignItems: "center", gap: 10, width: "100%",
+                      padding: "11px 13px", borderRadius: 10, cursor: "pointer",
+                      fontSize: 13.5, fontWeight: 600, fontFamily: "inherit", textAlign: "left",
+                      background: on ? t.accentBg : t.bgCard2,
+                      border: `1px solid ${on ? t.green : t.border}`,
+                      color: on ? t.green : t.text }}>
+                    <Icon d={ICONS.film} size={15} />
+                    <span style={{ flex: 1, whiteSpace: "nowrap", overflow: "hidden",
+                      textOverflow: "ellipsis" }}>{pf.name}</span>
+                    <span style={{ fontSize: 12, color: t.textDim }}>
+                      {tracks.filter((tr) => tr.usedBy && tr.usedBy[pf.id]).length} used
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button onClick={() => { setProjectPrompt(false); setNewItem({ kind: "profile", name: "" }); }}
+                style={{ flex: 1, display: "inline-flex", alignItems: "center", justifyContent: "center",
+                  gap: 7, padding: "9px 14px",
+                  borderRadius: 9, border: `1px solid ${t.border}`, background: t.bgCard2,
+                  color: t.green, cursor: "pointer", fontSize: 13, fontWeight: 600, fontFamily: "inherit" }}>
+                <Icon d={ICONS.plus} size={14} /> New project
+              </button>
+            </div>
+            <div onClick={() => { setSettings((p) => ({ ...p, askProjectOnOpen: false })); setProjectPrompt(false); }}
+              style={{ marginTop: 14, fontSize: 12, color: t.textDim, cursor: "pointer", textAlign: "center" }}>
+              Don't ask me on startup
+            </div>
+          </div>
+        </div>
+      )}
+
+      {renameItem && (
+        <div onMouseDown={(e) => { if (e.target === e.currentTarget) setRenameItem(null); }}
+          className="vf-overlay" style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)",
+            display: "grid", placeItems: "center", zIndex: 74 }}>
+          <div className="vf-card" onClick={(e) => e.stopPropagation()}
+            style={{ width: 360, maxWidth: "90vw", background: t.bgCard, borderRadius: 14,
+              border: `1px solid ${t.border}`, padding: 22, boxShadow: "0 20px 60px rgba(0,0,0,0.4)" }}>
+            <div style={{ fontSize: 16, fontWeight: 700, marginBottom: 16 }}>
+              Rename {renameItem.kind === "playlist" ? "playlist" : "project"}
+            </div>
+            <input autoFocus value={renameItem.name}
+              onChange={(e) => setRenameItem((r) => ({ ...r, name: e.target.value }))}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && renameItem.name.trim()) {
+                  if (renameItem.kind === "playlist") renamePlaylist(renameItem.id, renameItem.name.trim());
+                  else renameProfile(renameItem.id, renameItem.name.trim());
+                  setRenameItem(null);
+                }
+                if (e.key === "Escape") setRenameItem(null);
+              }}
+              style={{ width: "100%", boxSizing: "border-box", padding: "9px 11px", marginBottom: 20,
+                background: t.bgCard2, border: `1px solid ${t.border}`, borderRadius: 8,
+                color: t.text, fontSize: 14, fontFamily: "inherit", outline: "none" }} />
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+              <button onClick={() => setRenameItem(null)}
+                style={{ padding: "8px 16px", borderRadius: 8, border: `1px solid ${t.border}`,
+                  background: t.bgCard2, color: t.textMuted, cursor: "pointer", fontSize: 13,
+                  fontWeight: 600, fontFamily: "inherit" }}>
+                Cancel
+              </button>
+              <button disabled={!renameItem.name.trim()}
+                onClick={() => {
+                  if (renameItem.kind === "playlist") renamePlaylist(renameItem.id, renameItem.name.trim());
+                  else renameProfile(renameItem.id, renameItem.name.trim());
+                  setRenameItem(null);
+                }}
+                style={{ padding: "8px 16px", borderRadius: 8, border: "none",
+                  background: renameItem.name.trim() ? t.green : t.bgCard2,
+                  color: renameItem.name.trim() ? "#fff" : t.textDim,
+                  cursor: renameItem.name.trim() ? "pointer" : "not-allowed",
+                  fontSize: 13, fontWeight: 600, fontFamily: "inherit" }}>
+                Save
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {playlistPicker && (() => {
         const ids = playlistPicker.trackIds;
@@ -1805,41 +1933,102 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Credits for used tracks */}
-              <div style={s.label}>Playlists &amp; projects</div>
-              <div style={{ display: "flex", gap: 8, marginBottom: 22, flexWrap: "wrap" }}>
-                <button onClick={deleteActivePlaylist} disabled={activePlaylist === "all"}
-                  style={{ display: "inline-flex", alignItems: "center", gap: 7, padding: "8px 13px",
-                    borderRadius: 9, fontFamily: "inherit", fontSize: 12.5, fontWeight: 600,
-                    cursor: activePlaylist === "all" ? "not-allowed" : "pointer", background: "transparent",
-                    border: `1px solid ${activePlaylist === "all" ? t.border : t.red}`,
-                    color: activePlaylist === "all" ? t.textDim : t.red }}>
-                  <Icon d={ICONS.trash} size={14} /> Delete current playlist
+              {/* Manage playlists */}
+              <div style={s.label}>Playlists</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 5, marginBottom: 18 }}>
+                {playlists.length === 0 && (
+                  <div style={{ fontSize: 12.5, color: t.textDim }}>No playlists yet.</div>
+                )}
+                {playlists.map((pl) => (
+                  <div key={pl.id} style={{ display: "flex", alignItems: "center", gap: 8,
+                    fontSize: 13, padding: "6px 9px", borderRadius: 8, background: t.bgCard2,
+                    border: `1px solid ${pl.id === activePlaylist ? t.green : t.border}` }}>
+                    <Icon d={ICONS.playlist} size={14} />
+                    <span style={{ flex: 1, whiteSpace: "nowrap", overflow: "hidden",
+                      textOverflow: "ellipsis", color: t.text }}>{pl.name}</span>
+                    <span style={{ fontSize: 12, color: t.textDim }}>
+                      {tracks.filter((tr) => (tr.playlists || []).includes(pl.id)).length}
+                    </span>
+                    <span onClick={() => setRenameItem({ kind: "playlist", id: pl.id, name: pl.name })}
+                      title="Rename"
+                      style={{ cursor: "pointer", color: t.textDim, display: "grid", placeItems: "center" }}>
+                      <Icon d={ICONS.edit} size={14} />
+                    </span>
+                    <span onClick={() => deletePlaylist(pl.id)} title="Delete playlist"
+                      style={{ cursor: "pointer", color: t.textDim, display: "grid", placeItems: "center" }}>
+                      <Icon d={ICONS.trash} size={14} />
+                    </span>
+                  </div>
+                ))}
+                <button onClick={() => setNewItem({ kind: "playlist", name: "" })}
+                  style={{ marginTop: 3, display: "flex", alignItems: "center", justifyContent: "center",
+                    gap: 7, padding: "7px 10px", borderRadius: 8, border: `1px dashed ${t.border}`,
+                    background: "transparent", color: t.textMuted, cursor: "pointer",
+                    fontSize: 12.5, fontWeight: 600, fontFamily: "inherit" }}>
+                  <Icon d={ICONS.plus} size={14} /> New playlist
                 </button>
-                <button onClick={deleteActiveProfile} disabled={profiles.length <= 1}
-                  style={{ display: "inline-flex", alignItems: "center", gap: 7, padding: "8px 13px",
-                    borderRadius: 9, fontFamily: "inherit", fontSize: 12.5, fontWeight: 600,
-                    cursor: profiles.length <= 1 ? "not-allowed" : "pointer", background: "transparent",
-                    border: `1px solid ${profiles.length <= 1 ? t.border : t.red}`,
-                    color: profiles.length <= 1 ? t.textDim : t.red }}>
-                  <Icon d={ICONS.trash} size={14} /> Delete current project
+              </div>
+
+              {/* Manage video projects */}
+              <div style={s.label}>Video projects</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 5, marginBottom: 18 }}>
+                {profiles.map((pf) => (
+                  <div key={pf.id} style={{ display: "flex", alignItems: "center", gap: 8,
+                    fontSize: 13, padding: "6px 9px", borderRadius: 8, background: t.bgCard2,
+                    border: `1px solid ${pf.id === activeProfile ? t.green : t.border}` }}>
+                    <Icon d={ICONS.film} size={14} />
+                    <span style={{ flex: 1, whiteSpace: "nowrap", overflow: "hidden",
+                      textOverflow: "ellipsis", color: t.text }}>{pf.name}</span>
+                    <span style={{ fontSize: 12, color: t.textDim }}>
+                      {tracks.filter((tr) => tr.usedBy && tr.usedBy[pf.id]).length}
+                    </span>
+                    <span onClick={() => setRenameItem({ kind: "profile", id: pf.id, name: pf.name })}
+                      title="Rename"
+                      style={{ cursor: "pointer", color: t.textDim, display: "grid", placeItems: "center" }}>
+                      <Icon d={ICONS.edit} size={14} />
+                    </span>
+                    <span onClick={() => profiles.length > 1 && deleteProfile(pf.id)}
+                      title={profiles.length > 1 ? "Delete project" : "Keep at least one project"}
+                      style={{ cursor: profiles.length > 1 ? "pointer" : "not-allowed",
+                        color: profiles.length > 1 ? t.textDim : t.border,
+                        display: "grid", placeItems: "center" }}>
+                      <Icon d={ICONS.trash} size={14} />
+                    </span>
+                  </div>
+                ))}
+                <button onClick={() => setNewItem({ kind: "profile", name: "" })}
+                  style={{ marginTop: 3, display: "flex", alignItems: "center", justifyContent: "center",
+                    gap: 7, padding: "7px 10px", borderRadius: 8, border: `1px dashed ${t.border}`,
+                    background: "transparent", color: t.textMuted, cursor: "pointer",
+                    fontSize: 12.5, fontWeight: 600, fontFamily: "inherit" }}>
+                  <Icon d={ICONS.plus} size={14} /> New project
                 </button>
+              </div>
+
+              {/* Ask for project on startup */}
+              <div style={s.label}>On startup</div>
+              <div style={{ marginBottom: 22 }}>
+                <span onClick={() => setSettings((p) => ({ ...p, askProjectOnOpen: !(p.askProjectOnOpen !== false) }))}
+                  className="vf-chip"
+                  style={{ ...s.chip(askProjectOnOpen, t.green), padding: "6px 11px", gap: 7 }}>
+                  <Icon d={ICONS.film} size={13} /> Ask which project on open
+                </span>
               </div>
 
               <div style={s.label}>Credits</div>
               <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 20 }}>
-                <button onClick={copyCredits} disabled={usedCount === 0}
+                <button onClick={copyCredits} disabled={creditCount === 0}
                   style={{ display: "inline-flex", alignItems: "center", gap: 8, padding: "9px 14px",
                     borderRadius: 9, border: "none", fontFamily: "inherit", fontSize: 13, fontWeight: 600,
-                    cursor: usedCount ? "pointer" : "not-allowed",
-                    background: usedCount ? t.green : t.bgCard2,
-                    color: usedCount ? "#fff" : t.textDim }}>
+                    cursor: creditCount ? "pointer" : "not-allowed",
+                    background: creditCount ? t.green : t.bgCard2,
+                    color: creditCount ? "#fff" : t.textDim }}>
                   <Icon d={creditsCopied ? ICONS.check : ICONS.clipboard} size={15} />
                   {creditsCopied ? "Copied!" : "Copy credits"}
                 </button>
                 <span style={{ fontSize: 12.5, color: t.textDim }}>
                   {usedCount > 0
-                    ? `${usedCount} used in "${(profiles.find((p) => p.id === activeProfile) || {}).name}"`
+                    ? `${creditCount} of ${usedCount} used track${usedCount !== 1 ? "s" : ""} credited`
                     : "No used tracks in this project"}
                 </span>
               </div>

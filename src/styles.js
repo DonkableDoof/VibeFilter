@@ -11,6 +11,7 @@ export const makeStyles = (t) => ({
   sidebar: {
     width: 280, minWidth: 280, background: t.bgCard,
     borderRight: `1px solid ${t.border}`, display: "flex", flexDirection: "column",
+    overflowY: "auto", overflowX: "hidden",
   },
   logo: {
     padding: "20px 18px", paddingTop: 38, display: "flex", alignItems: "center", gap: 10,
