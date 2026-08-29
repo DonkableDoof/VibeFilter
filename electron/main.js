@@ -237,16 +237,24 @@ ipcMain.handle("bank:delete", (_e, id) => {
 });
 
 // ─── Drag a track OUT into Premiere (or any app/Finder) ───
-ipcMain.on("drag:start", (event, filePath) => {
+ipcMain.on("drag:start", (event, filePath, iconDataUrl) => {
   if (!filePath || !fs.existsSync(filePath)) return;
-  // A generic file icon; Premiere only cares about the file path.
-  const icon = nativeImage.createFromNamedImage
-    ? nativeImage.createFromNamedImage("NSAudio", [0, 0, 1])
-    : nativeImage.createEmpty();
-  event.sender.startDrag({
-    file: filePath,
-    icon: icon.isEmpty() ? path.join(__dirname, "drag-icon.png") : icon,
-  });
+  // Prefer the card image rendered by the UI so the drag shows the track,
+  // not a generic file icon.
+  let icon = null;
+  if (typeof iconDataUrl === "string" && iconDataUrl.startsWith("data:image/")) {
+    try {
+      const img = nativeImage.createFromDataURL(iconDataUrl);
+      if (!img.isEmpty()) icon = img;
+    } catch (e) { /* fall through to the default icon */ }
+  }
+  if (!icon) {
+    const named = nativeImage.createFromNamedImage
+      ? nativeImage.createFromNamedImage("NSAudio", [0, 0, 1])
+      : nativeImage.createEmpty();
+    icon = named.isEmpty() ? path.join(__dirname, "drag-icon.png") : named;
+  }
+  event.sender.startDrag({ file: filePath, icon });
 });
 
 // ─── Reveal a file in Finder/Explorer (fallback / convenience) ───

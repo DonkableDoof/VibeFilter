@@ -24,7 +24,7 @@ contextBridge.exposeInMainWorld("vf", {
   },
 
   // Drag a track out into Premiere / Finder / Explorer
-  startDrag: (filePath) => ipcRenderer.send("drag:start", filePath),
+  startDrag: (filePath, iconDataUrl) => ipcRenderer.send("drag:start", filePath, iconDataUrl),
 
   // Reveal in Finder/Explorer
   reveal: (filePath) => ipcRenderer.send("file:reveal", filePath),

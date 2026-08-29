@@ -81,6 +81,10 @@ export default function App() {
   const [playlistPicker, setPlaylistPicker] = useState(null); // { trackIds: [] } | null
   const [renameItem, setRenameItem] = useState(null); // { kind, id, name } | null
   const [projectPrompt, setProjectPrompt] = useState(false); // startup project chooser
+  const [creditsOpen, setCreditsOpen] = useState(false);     // credits editor
+  const [tagsOpen, setTagsOpen] = useState(false);           // manage-tags popup
+  const dragCreditIndex = useRef(null);
+  const [dragOverCredit, setDragOverCredit] = useState(null);
   const [winW, setWinW] = useState(typeof window !== "undefined" ? window.innerWidth : 1200);
   const [hoverSlice, setHoverSlice] = useState(null); // index of hovered pie slice, or null
   const dragTagIndex = useRef(null);                  // index of tag being dragged
@@ -100,8 +104,14 @@ export default function App() {
   const tileSize = settings.tileSize || "medium";
   const setTileSize = (size) => setSettings((p) => ({ ...p, tileSize: size }));
   const nameLast = !!settings.nameLast;
-  const loopEnabled = settings.loop !== false; // default on
-  const toggleLoop = () => setSettings((p) => ({ ...p, loop: !(p.loop !== false) }));
+  // Loop cycles: "list" (wrap the filtered list) → "one" (repeat this track) → "off".
+  // Migrates from the older boolean `loop` setting.
+  const loopMode = settings.loopMode || (settings.loop === false ? "off" : "list");
+  const cycleLoop = () => setSettings((p) => {
+    const cur = p.loopMode || (p.loop === false ? "off" : "list");
+    const next = cur === "list" ? "one" : cur === "one" ? "off" : "list";
+    return { ...p, loopMode: next };
+  });
 
   // ── Playlists ──
   // "All" is a virtual playlist that always shows every track.
@@ -629,19 +639,30 @@ export default function App() {
   const totalMinutes = Math.round(tracks.reduce((sum, tr) => sum + (tr.durationSec || 0), 0) / 60);
   const usedCount = tracks.filter((tr) => isUsed(tr)).length;
 
-  // "Artist — Title" lines for every used track, sorted by artist then title.
-  // Tracks flagged noCredit (via right-click) are left out.
+  // Credited tracks for the active project, in the order they were used.
+  // A saved custom order (from dragging in the credits editor) takes priority;
+  // anything not in that list falls in afterwards by use time.
+  const creditTracks = (() => {
+    const list = tracks.filter((tr) => isUsed(tr) && !tr.noCredit);
+    const saved = (settings.creditOrder || {})[activeProfile] || [];
+    const rank = new Map(saved.map((id, i) => [id, i]));
+    return list.sort((a, b) => {
+      const ra = rank.has(a.id) ? rank.get(a.id) : Infinity;
+      const rb = rank.has(b.id) ? rank.get(b.id) : Infinity;
+      if (ra !== rb) return ra - rb;
+      return usedAtFor(a) - usedAtFor(b); // otherwise: order of use
+    });
+  })();
+  const creditCount = creditTracks.length;
   const creditsText = () =>
-    tracks
-      .filter((tr) => isUsed(tr) && !tr.noCredit)
+    creditTracks
       .map((tr) => parseName(tr))
-      .sort((a, b) => {
-        const byArtist = (a.artist || "").localeCompare(b.artist || "", undefined, { sensitivity: "base" });
-        return byArtist !== 0 ? byArtist : a.title.localeCompare(b.title, undefined, { sensitivity: "base" });
-      })
       .map(({ title, artist }) => (artist ? `${artist} — ${title}` : title))
       .join("\n");
-  const creditCount = tracks.filter((tr) => isUsed(tr) && !tr.noCredit).length;
+  // Persist a new credit order for the active project.
+  const saveCreditOrder = (ids) => setSettings((p) => ({
+    ...p, creditOrder: { ...(p.creditOrder || {}), [activeProfile]: ids },
+  }));
   const toggleNoCredit = (id) => {
     setTracks((prev) => prev.map((tr) => (tr.id === id ? { ...tr, noCredit: !tr.noCredit } : tr)));
   };
@@ -683,15 +704,20 @@ export default function App() {
     selectTrack(pick);
   };
 
-  // Play the next track in the current list order, wrapping to the first at the end.
-  // Independent of shuffle — shuffle only picks the *current* random track.
+  // What happens when a track finishes, per the loop mode.
   const playNext = () => {
+    // "one" repeats the current track.
+    if (loopMode === "one") {
+      const a = audioRef.current;
+      if (a) { a.currentTime = 0; setCurTime(0); a.play().then(() => setIsPlaying(true)).catch(() => {}); }
+      return;
+    }
     const pool = filtered;
     if (pool.length === 0) return;
     const idx = pool.findIndex((tr) => tr.id === selectedId);
     if (idx === -1) { selectTrack(pool[0]); return; }
     const atEnd = idx === pool.length - 1;
-    if (atEnd && !loopEnabled) return; // stop at the end unless looping
+    if (atEnd && loopMode === "off") return; // stop at the end
     selectTrack(pool[(idx + 1) % pool.length]);
   };
   // Keep the ref current so the <audio> "ended" handler always calls the
@@ -746,11 +772,63 @@ export default function App() {
   };
   const exitSelectMode = () => { setSelectMode(false); setSelectedTracks(new Set()); };
 
+  // Render a small "card" of the track (cover + title) to a data URL, so the OS
+  // drag shows the card instead of a generic file icon. Falls back to null.
+  const buildDragImage = (tileEl, tr) => {
+    try {
+      const W = 180, H = 180;
+      const canvas = document.createElement("canvas");
+      canvas.width = W; canvas.height = H;
+      const ctx = canvas.getContext("2d");
+      const r = 14;
+      // rounded card background
+      ctx.beginPath();
+      ctx.moveTo(r, 0);
+      ctx.arcTo(W, 0, W, H, r); ctx.arcTo(W, H, 0, H, r);
+      ctx.arcTo(0, H, 0, 0, r); ctx.arcTo(0, 0, W, 0, r);
+      ctx.closePath();
+      ctx.fillStyle = t.bgCard;
+      ctx.fill();
+      ctx.save();
+      ctx.clip();
+      // cover art, taken from the tile's already-loaded <img>
+      const img = tileEl && tileEl.querySelector("img");
+      if (img && img.complete && img.naturalWidth) {
+        ctx.drawImage(img, 0, 0, W, H - 34);
+      } else {
+        const g = ctx.createLinearGradient(0, 0, W, H);
+        g.addColorStop(0, t.green); g.addColorStop(1, t.orange);
+        ctx.fillStyle = g;
+        ctx.fillRect(0, 0, W, H - 34);
+      }
+      // title strip
+      ctx.fillStyle = t.bgCard;
+      ctx.fillRect(0, H - 34, W, 34);
+      ctx.fillStyle = t.text;
+      ctx.font = "600 13px 'DM Sans', system-ui, sans-serif";
+      const { title } = parseName(tr);
+      let label = title;
+      while (ctx.measureText(label).width > W - 20 && label.length > 1) label = label.slice(0, -1);
+      if (label !== title) label = label.slice(0, -1) + "…";
+      ctx.fillText(label, 10, H - 13);
+      ctx.restore();
+      // accent border
+      ctx.strokeStyle = t.green;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      return canvas.toDataURL("image/png");
+    } catch {
+      return null; // tainted canvas or anything unexpected — use the default icon
+    }
+  };
+
   // Hand a track off to the OS so it can be dragged into Premiere / Explorer,
   // and mark it "used" so it can be hidden until the user resets.
   const onTrackDragStart = (e, tr) => {
     e.preventDefault();
-    window.vf.startDrag(tr.filePath);
+    if (selectMode) return; // no dragging out while bulk-selecting
+    const dragImage = buildDragImage(e.currentTarget, tr);
+    window.vf.startDrag(tr.filePath, dragImage);
     // usedAt lets "Undo use" find the most recently used track, even after a restart.
     setTracks((prev) => prev.map((x) => (x.id === tr.id ? markUsed(x, true) : x)));
   };
@@ -983,45 +1061,23 @@ export default function App() {
 
         <div style={s.section}>
           <div style={s.label}>Manage tags</div>
-          <button onClick={openAddTag}
+          <button onClick={() => setTagsOpen(true)}
             style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 7,
-              width: "100%", padding: "8px 10px", marginBottom: 10, borderRadius: 8,
-              border: `1px dashed ${t.border}`, background: t.bgCard2, color: t.textMuted,
+              width: "100%", padding: "8px 10px", borderRadius: 8,
+              border: `1px solid ${t.border}`, background: t.bgCard2, color: t.text,
               cursor: "pointer", fontSize: 13, fontWeight: 600, fontFamily: "inherit" }}>
-            <Icon d={ICONS.plus} size={15} /> Add tag
+            <Icon d={ICONS.tagIcon} size={15} /> Manage tags ({tags.length})
           </button>
-          <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
-            {tags.map((tg, i) => (
-              <div key={tg.id}
-                draggable
-                onDragStart={() => { dragTagIndex.current = i; }}
-                onDragOver={(e) => { e.preventDefault(); setDragOverTag(i); }}
-                onDragLeave={() => setDragOverTag((cur) => (cur === i ? null : cur))}
-                onDrop={(e) => { e.preventDefault(); reorderTags(dragTagIndex.current, i); dragTagIndex.current = null; setDragOverTag(null); }}
-                onDragEnd={() => { dragTagIndex.current = null; setDragOverTag(null); }}
-                style={{ display: "flex", alignItems: "center", gap: 7, fontSize: 13,
-                  padding: "2px 0", borderRadius: 6,
-                  borderTop: `2px solid ${dragOverTag === i && dragTagIndex.current !== null ? t.green : "transparent"}` }}>
-                <span style={{ cursor: "grab", color: t.textDim, display: "grid", placeItems: "center", flexShrink: 0 }}
-                  title="Drag to reorder">
-                  <Icon d={ICONS.grip} size={14} />
-                </span>
-                <input type="color" className="vf-swatch" value={tg.color}
-                  title="Change colour"
-                  onChange={(e) => setTagColor(tg.id, e.target.value)}
-                  style={{ width: 16, height: 16, flexShrink: 0, borderRadius: 5 }} />
-                <span style={{ flex: 1, color: t.textMuted, whiteSpace: "nowrap",
-                  overflow: "hidden", textOverflow: "ellipsis" }}>{tg.label}</span>
-                <span onClick={() => removeTag(tg.id)}
-                  title="Delete tag"
-                  onMouseEnter={(e) => (e.currentTarget.style.color = t.textMuted)}
-                  onMouseLeave={(e) => (e.currentTarget.style.color = t.textDim)}
-                  style={{ cursor: "pointer", color: t.textDim, display: "grid", placeItems: "center", flexShrink: 0 }}>
-                  <Icon d={ICONS.x} size={14} />
-                </span>
-              </div>
-            ))}
-          </div>
+          <button onClick={() => setCreditsOpen(true)} disabled={creditCount === 0}
+            style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 7,
+              width: "100%", padding: "8px 10px", marginTop: 8, borderRadius: 8,
+              border: `1px solid ${t.border}`,
+              background: creditCount ? t.bgCard2 : "transparent",
+              color: creditCount ? t.text : t.textDim,
+              cursor: creditCount ? "pointer" : "not-allowed",
+              fontSize: 13, fontWeight: 600, fontFamily: "inherit" }}>
+            <Icon d={ICONS.clipboard} size={15} /> Credits ({creditCount})
+          </button>
         </div>
 
         <div style={{ marginTop: "auto", padding: 18, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
@@ -1348,16 +1404,18 @@ export default function App() {
                 </div>
 
                 <div style={{ display: "flex", justifyContent: "center", alignItems: "center", gap: 14, marginBottom: 18 }}>
-                  <button onClick={toggleLoop}
-                    title={loopEnabled ? "Looping filtered tracks" : "Stop at end of list"}
+                  <button onClick={cycleLoop}
+                    title={loopMode === "list" ? "Looping filtered tracks — click to repeat one"
+                      : loopMode === "one" ? "Repeating this track — click to turn off"
+                      : "Loop off — click to loop the list"}
                     style={{
                       width: 42, height: 42, borderRadius: "50%", cursor: "pointer",
-                      background: loopEnabled ? t.accentBg : t.bgCard2,
-                      border: `1px solid ${loopEnabled ? t.green : t.border}`,
-                      color: loopEnabled ? t.green : t.textMuted,
+                      background: loopMode !== "off" ? t.accentBg : t.bgCard2,
+                      border: `1px solid ${loopMode !== "off" ? t.green : t.border}`,
+                      color: loopMode !== "off" ? t.green : t.textMuted,
                       display: "grid", placeItems: "center",
                     }}>
-                    <Icon d={ICONS.loop} size={17} />
+                    <Icon d={loopMode === "one" ? ICONS.loopOne : ICONS.loop} size={17} />
                   </button>
                   <button onClick={togglePlay}
                     style={{
@@ -1533,6 +1591,158 @@ export default function App() {
         </>
       ); })()}
 
+      {tagsOpen && (
+        <div onMouseDown={(e) => { if (e.target === e.currentTarget) setTagsOpen(false); }}
+          className="vf-overlay" style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)",
+            display: "grid", placeItems: "center", zIndex: 74 }}>
+          <div className="vf-card" onClick={(e) => e.stopPropagation()}
+            style={{ width: 400, maxWidth: "90vw", maxHeight: "78vh", background: t.bgCard,
+              borderRadius: 14, border: `1px solid ${t.border}`, padding: 22,
+              display: "flex", flexDirection: "column", boxShadow: "0 20px 60px rgba(0,0,0,0.4)" }}>
+            <div style={{ display: "flex", alignItems: "center", marginBottom: 4 }}>
+              <div style={{ fontSize: 16, fontWeight: 700, flex: 1 }}>Manage tags</div>
+              <span onClick={() => setTagsOpen(false)}
+                style={{ cursor: "pointer", color: t.textMuted, display: "grid", placeItems: "center", padding: 4 }}>
+                <Icon d={ICONS.x} size={18} />
+              </span>
+            </div>
+            <div style={{ fontSize: 12.5, color: t.textDim, marginBottom: 16 }}>
+              Drag to reorder. Click a swatch to recolour.
+            </div>
+            <div className="vf-scroll" style={{ overflow: "auto", minHeight: 0, flex: 1,
+              display: "flex", flexDirection: "column", gap: 5, marginBottom: 16 }}>
+              {tags.length === 0 && (
+                <div style={{ fontSize: 13, color: t.textDim, padding: "10px 0" }}>No tags yet.</div>
+              )}
+              {tags.map((tg, i) => (
+                <div key={tg.id}
+                  draggable
+                  onDragStart={() => { dragTagIndex.current = i; }}
+                  onDragOver={(e) => { e.preventDefault(); setDragOverTag(i); }}
+                  onDragLeave={() => setDragOverTag((cur) => (cur === i ? null : cur))}
+                  onDrop={(e) => { e.preventDefault(); reorderTags(dragTagIndex.current, i); dragTagIndex.current = null; setDragOverTag(null); }}
+                  onDragEnd={() => { dragTagIndex.current = null; setDragOverTag(null); }}
+                  style={{ display: "flex", alignItems: "center", gap: 9, fontSize: 13,
+                    padding: "8px 10px", borderRadius: 9, background: t.bgCard2,
+                    border: `1px solid ${t.border}`,
+                    borderTop: `2px solid ${dragOverTag === i && dragTagIndex.current !== null ? t.green : t.border}` }}>
+                  <span style={{ cursor: "grab", color: t.textDim, display: "grid", placeItems: "center", flexShrink: 0 }}
+                    title="Drag to reorder">
+                    <Icon d={ICONS.grip} size={14} />
+                  </span>
+                  <input type="color" className="vf-swatch" value={tg.color}
+                    title="Change colour"
+                    onChange={(e) => setTagColor(tg.id, e.target.value)}
+                    style={{ width: 18, height: 18, flexShrink: 0, borderRadius: 5 }} />
+                  <span style={{ flex: 1, color: t.text, whiteSpace: "nowrap",
+                    overflow: "hidden", textOverflow: "ellipsis" }}>{tg.label}</span>
+                  <span style={{ fontSize: 12, color: t.textDim }}>
+                    {tracks.filter((tr) => (tr.tags || []).includes(tg.id)).length}
+                  </span>
+                  <span onClick={() => removeTag(tg.id)} title="Delete tag"
+                    onMouseEnter={(e) => (e.currentTarget.style.color = t.red)}
+                    onMouseLeave={(e) => (e.currentTarget.style.color = t.textDim)}
+                    style={{ cursor: "pointer", color: t.textDim, display: "grid", placeItems: "center", flexShrink: 0 }}>
+                    <Icon d={ICONS.trash} size={14} />
+                  </span>
+                </div>
+              ))}
+            </div>
+            <button onClick={openAddTag}
+              style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 7,
+                width: "100%", padding: "9px 10px", borderRadius: 9,
+                border: `1px dashed ${t.border}`, background: "transparent", color: t.green,
+                cursor: "pointer", fontSize: 13, fontWeight: 600, fontFamily: "inherit" }}>
+              <Icon d={ICONS.plus} size={15} /> Add tag
+            </button>
+          </div>
+        </div>
+      )}
+
+      {creditsOpen && (
+        <div onMouseDown={(e) => { if (e.target === e.currentTarget) setCreditsOpen(false); }}
+          className="vf-overlay" style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)",
+            display: "grid", placeItems: "center", zIndex: 76 }}>
+          <div className="vf-card" onClick={(e) => e.stopPropagation()}
+            style={{ width: 440, maxWidth: "92vw", maxHeight: "80vh", background: t.bgCard,
+              borderRadius: 14, border: `1px solid ${t.border}`, padding: 22,
+              display: "flex", flexDirection: "column", boxShadow: "0 20px 60px rgba(0,0,0,0.4)" }}>
+            <div style={{ display: "flex", alignItems: "center", marginBottom: 4 }}>
+              <div style={{ fontSize: 16, fontWeight: 700, flex: 1 }}>Credits</div>
+              <span onClick={() => setCreditsOpen(false)}
+                style={{ cursor: "pointer", color: t.textMuted, display: "grid", placeItems: "center", padding: 4 }}>
+                <Icon d={ICONS.x} size={18} />
+              </span>
+            </div>
+            <div style={{ fontSize: 12.5, color: t.textDim, marginBottom: 16 }}>
+              {creditCount} of {usedCount} used track{usedCount !== 1 ? "s" : ""} in{" "}
+              “{(profiles.find((p) => p.id === activeProfile) || {}).name}”, in order of use.
+              Drag to rearrange before copying.
+            </div>
+            <div className="vf-scroll" style={{ overflow: "auto", minHeight: 0, flex: 1,
+              display: "flex", flexDirection: "column", gap: 5, marginBottom: 16 }}>
+              {creditTracks.map((tr, i) => {
+                const { title, artist } = parseName(tr);
+                return (
+                  <div key={tr.id}
+                    draggable
+                    onDragStart={() => { dragCreditIndex.current = i; }}
+                    onDragOver={(e) => { e.preventDefault(); setDragOverCredit(i); }}
+                    onDragLeave={() => setDragOverCredit((cur) => (cur === i ? null : cur))}
+                    onDrop={(e) => {
+                      e.preventDefault();
+                      const from = dragCreditIndex.current;
+                      if (from != null && from !== i) {
+                        const ids = creditTracks.map((x) => x.id);
+                        const [moved] = ids.splice(from, 1);
+                        ids.splice(i, 0, moved);
+                        saveCreditOrder(ids);
+                      }
+                      dragCreditIndex.current = null; setDragOverCredit(null);
+                    }}
+                    onDragEnd={() => { dragCreditIndex.current = null; setDragOverCredit(null); }}
+                    style={{ display: "flex", alignItems: "center", gap: 9, fontSize: 13,
+                      padding: "8px 10px", borderRadius: 9, background: t.bgCard2,
+                      border: `1px solid ${t.border}`,
+                      borderTop: `2px solid ${dragOverCredit === i && dragCreditIndex.current !== null ? t.green : t.border}` }}>
+                    <span style={{ cursor: "grab", color: t.textDim, display: "grid", placeItems: "center", flexShrink: 0 }}
+                      title="Drag to reorder">
+                      <Icon d={ICONS.grip} size={14} />
+                    </span>
+                    <span style={{ width: 20, flexShrink: 0, color: t.textDim, fontSize: 12 }}>{i + 1}</span>
+                    <span style={{ flex: 1, minWidth: 0, whiteSpace: "nowrap", overflow: "hidden",
+                      textOverflow: "ellipsis", color: t.text }}>
+                      {artist ? `${artist} — ${title}` : title}
+                    </span>
+                    <span onClick={() => toggleNoCredit(tr.id)} title="Exclude from credits"
+                      onMouseEnter={(e) => (e.currentTarget.style.color = t.red)}
+                      onMouseLeave={(e) => (e.currentTarget.style.color = t.textDim)}
+                      style={{ cursor: "pointer", color: t.textDim, display: "grid", placeItems: "center", flexShrink: 0 }}>
+                      <Icon d={ICONS.x} size={14} />
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+              <button onClick={() => saveCreditOrder([])}
+                style={{ padding: "9px 14px", borderRadius: 9, border: `1px solid ${t.border}`,
+                  background: t.bgCard2, color: t.textMuted, cursor: "pointer", fontSize: 13,
+                  fontWeight: 600, fontFamily: "inherit" }}>
+                Reset to use order
+              </button>
+              <button onClick={copyCredits}
+                style={{ display: "inline-flex", alignItems: "center", gap: 8, padding: "9px 16px",
+                  borderRadius: 9, border: "none", background: t.green, color: "#fff",
+                  cursor: "pointer", fontSize: 13, fontWeight: 600, fontFamily: "inherit" }}>
+                <Icon d={creditsCopied ? ICONS.check : ICONS.clipboard} size={15} />
+                {creditsCopied ? "Copied!" : "Copy credits"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {projectPrompt && (
         <div className="vf-overlay" style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)",
           display: "grid", placeItems: "center", zIndex: 90 }}>
@@ -1706,7 +1916,7 @@ export default function App() {
       {newItem && (
         <div onMouseDown={(e) => { if (e.target === e.currentTarget) setNewItem(null); }}
           className="vf-overlay" style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)",
-            display: "grid", placeItems: "center", zIndex: 70 }}>
+            display: "grid", placeItems: "center", zIndex: 96 }}>
           <div className="vf-card" onClick={(e) => e.stopPropagation()}
             style={{ width: 360, maxWidth: "90vw", background: t.bgCard, borderRadius: 14,
               border: `1px solid ${t.border}`, padding: 22, boxShadow: "0 20px 60px rgba(0,0,0,0.4)" }}>
@@ -1748,7 +1958,7 @@ export default function App() {
       {addTagOpen && (
         <div onMouseDown={(e) => { if (e.target === e.currentTarget) setAddTagOpen(false); }}
           className="vf-overlay" style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)",
-            display: "grid", placeItems: "center", zIndex: 70 }}>
+            display: "grid", placeItems: "center", zIndex: 94 }}>
           <div className="vf-card" onClick={(e) => e.stopPropagation()}
             style={{ width: 340, maxWidth: "90vw", background: t.bgCard, borderRadius: 14,
               border: `1px solid ${t.border}`, padding: 22, boxShadow: "0 20px 60px rgba(0,0,0,0.4)" }}>
@@ -1789,7 +1999,7 @@ export default function App() {
       {renaming && (
         <div onMouseDown={(e) => { if (e.target === e.currentTarget) setRenaming(null); }}
           className="vf-overlay" style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.55)",
-            display: "grid", placeItems: "center", zIndex: 70 }}>
+            display: "grid", placeItems: "center", zIndex: 78 }}>
           <div className="vf-card" onClick={(e) => e.stopPropagation()}
             style={{ width: 380, maxWidth: "90vw", background: t.bgCard, borderRadius: 14,
               border: `1px solid ${t.border}`, padding: 22, boxShadow: "0 20px 60px rgba(0,0,0,0.4)" }}>
@@ -2012,24 +2222,6 @@ export default function App() {
                   className="vf-chip"
                   style={{ ...s.chip(askProjectOnOpen, t.green), padding: "6px 11px", gap: 7 }}>
                   <Icon d={ICONS.film} size={13} /> Ask which project on open
-                </span>
-              </div>
-
-              <div style={s.label}>Credits</div>
-              <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 20 }}>
-                <button onClick={copyCredits} disabled={creditCount === 0}
-                  style={{ display: "inline-flex", alignItems: "center", gap: 8, padding: "9px 14px",
-                    borderRadius: 9, border: "none", fontFamily: "inherit", fontSize: 13, fontWeight: 600,
-                    cursor: creditCount ? "pointer" : "not-allowed",
-                    background: creditCount ? t.green : t.bgCard2,
-                    color: creditCount ? "#fff" : t.textDim }}>
-                  <Icon d={creditsCopied ? ICONS.check : ICONS.clipboard} size={15} />
-                  {creditsCopied ? "Copied!" : "Copy credits"}
-                </button>
-                <span style={{ fontSize: 12.5, color: t.textDim }}>
-                  {usedCount > 0
-                    ? `${creditCount} of ${usedCount} used track${usedCount !== 1 ? "s" : ""} credited`
-                    : "No used tracks in this project"}
                 </span>
               </div>
 
